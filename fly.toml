@@ -1,5 +1,5 @@
 # Rename `app` below to whatever `fly launch` picks or you prefer.
-app = "combined-discount"
+app = "combined-discount-treelogy"
 primary_region = "sin"
 
 [build]
