@@ -2,16 +2,34 @@ use super::schema;
 use shopify_function::prelude::*;
 use shopify_function::Result;
 
+use super::cart_lines_discounts_generate_run::{utm_gate_blocks, Configuration};
+
 #[shopify_function]
 fn cart_delivery_options_discounts_generate_run(
     input: schema::cart_delivery_options_discounts_generate_run::Input,
 ) -> Result<schema::CartDeliveryOptionsDiscountsGenerateRunResult> {
-    let has_shipping_discount_class = input
+    let config: &Configuration = match input.discount().metafield() {
+        Some(metafield) => metafield.json_value(),
+        None => {
+            return Ok(schema::CartDeliveryOptionsDiscountsGenerateRunResult { operations: vec![] });
+        }
+    };
+
+    let utm_value: Option<String> = input
+        .cart()
+        .utm_attribute()
+        .as_ref()
+        .and_then(|a| a.value().cloned());
+    if utm_gate_blocks(&config.required_utm_campaign, utm_value.as_ref()) {
+        return Ok(schema::CartDeliveryOptionsDiscountsGenerateRunResult { operations: vec![] });
+    }
+
+    let has_shipping_class = input
         .discount()
         .discount_classes()
         .contains(&schema::DiscountClass::Shipping);
 
-    if !has_shipping_discount_class {
+    if !has_shipping_class || !config.free_shipping.unwrap_or(false) {
         return Ok(schema::CartDeliveryOptionsDiscountsGenerateRunResult { operations: vec![] });
     }
 

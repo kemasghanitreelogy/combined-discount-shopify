@@ -20,6 +20,7 @@ description = "One discount code that applies a fixed amount off AND free shippi
   [extensions.build]
   command = "cargo build --target=wasm32-unknown-unknown --release"
   path = "target/wasm32-unknown-unknown/release/combined_discount.wasm"
+  watch = ["src/**/*.rs", "src/**/*.graphql"]
 
   [[extensions.metafields]]
   namespace = "$app"

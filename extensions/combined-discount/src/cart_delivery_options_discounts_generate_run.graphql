@@ -1,5 +1,8 @@
 query Input {
   cart {
+    utmAttribute: attribute(key: "utm_campaign") {
+      value
+    }
     deliveryGroups {
       deliveryOptions {
         handle
@@ -8,5 +11,8 @@ query Input {
   }
   discount {
     discountClasses
+    metafield(namespace: "$app", key: "function-configuration") {
+      jsonValue
+    }
   }
 }

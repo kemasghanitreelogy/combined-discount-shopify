@@ -1,10 +1,26 @@
 query Input {
   cart {
+    utmAttribute: attribute(key: "utm_campaign") {
+      value
+    }
     lines {
       id
+      quantity
       cost {
         subtotalAmount {
           amount
+        }
+        amountPerQuantity {
+          amount
+        }
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          id
+          product {
+            id
+          }
         }
       }
     }
