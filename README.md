@@ -537,21 +537,299 @@ Both paths exist inside the globally-installed `@shopify/cli` package. The tramp
 
 ## Deployment
 
+Deploying this app to production is a **two-track** process:
+
+1. **Shopify side** — push the Function extension + app config to Shopify via `shopify app deploy`
+2. **Host side** — deploy the embedded admin (React Router) to an HTTPS host. This README covers **Fly.io** (compute) + **Neon** (Postgres) as the recommended stack, because:
+   - Fly.io runs the Docker image + `release_command` handles Prisma migrations automatically
+   - Neon's free tier (0.5 GB Postgres, auto-pauses) covers session storage without paying for a dedicated DB VM
+   - Combined monthly cost is ~$1–3 for low-traffic admin apps
+
+### Recommended stack
+
+```
+┌────────────────────────┐       ┌──────────────────────────┐
+│  Shopify merchant      │ https │  Fly.io machine          │
+│  admin → embedded app  ├──────►│  Node 20 + React Router  │
+└────────────────────────┘       │  prisma client           │
+                                 └──────────┬───────────────┘
+                                            │ DATABASE_URL
+                                            ▼
+                                 ┌──────────────────────────┐
+                                 │  Neon (Postgres)         │
+                                 │  Session table only      │
+                                 └──────────────────────────┘
+```
+
+The Function itself doesn't run on Fly — Shopify hosts and executes the compiled wasm. Fly only hosts the admin web server.
+
+### 1. Set up Neon (Postgres)
+
+1. Sign up at [neon.tech](https://neon.tech).
+2. Create a project, e.g. `combined-discount-shopify`:
+   - Postgres version: **17** (default)
+   - Region: pick the one nearest to your Fly region (e.g. AWS `ap-southeast-1 Singapore` to match Fly's `sin`)
+3. From the project's **Connect** dialog, copy the **Prisma** connection string. It looks like:
+   ```
+   postgresql://<user>:<password>@ep-xxx-yyy.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+   ```
+   - `?sslmode=require` is mandatory — Neon only accepts TLS connections.
+4. Keep this string handy; you'll set it as `DATABASE_URL` on Fly.
+
+> **Do I need `npx neonctl init`?** Only if you want to run the app locally against Neon. For deploy-to-Fly, skip the CLI — all you need is the connection string.
+
+### 2. Switch Prisma to Postgres
+
+`prisma/schema.prisma` has already been configured for production Postgres:
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+A Postgres-compatible baseline migration lives in `prisma/migrations/20260422000000_init/`. `prisma/migrations/migration_lock.toml` pins the provider:
+
+```toml
+provider = "postgresql"
+```
+
+If you re-run `prisma migrate dev` against a fresh local DB you may need to delete the existing migration folder and regenerate — but for production the baseline is already correct.
+
+### 3. Dockerfile
+
+A `Dockerfile` at the repo root builds a production image:
+
+```dockerfile
+FROM node:20-alpine
+RUN apk add --no-cache openssl
+EXPOSE 3000
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=3000
+COPY package.json package-lock.json* ./
+COPY prisma ./prisma
+RUN npm ci --omit=dev && npm cache clean --force
+RUN npx prisma generate
+COPY . .
+RUN npm run build
+CMD ["npm", "run", "docker-start"]
+```
+
+- `openssl` is required by Prisma's query engine.
+- `prisma generate` runs at build time so cold starts skip the client codegen step.
+- `npm run docker-start` is the production entrypoint defined in `package.json`.
+
+### 4. `fly.toml`
+
+```toml
+app = "combined-discount-treelogy"
+primary_region = "sin"
+
+[build]
+
+[env]
+  PORT = "3000"
+  NODE_ENV = "production"
+  SCOPES = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[deploy]
+  release_command = "npx prisma migrate deploy"
+```
+
+- **`app`** must be globally unique across all of Fly.io. If you see `Failed to create app`, rename this to something more specific (e.g. `combined-discount-<yourorg>`).
+- **`auto_stop_machines` / `min_machines_running = 0`** stops the VM when idle, so you only pay while the admin is actively loading. Cold start is ~1–2 s, acceptable for admin use.
+- **`release_command`** runs before each new release replaces the running machine — `prisma migrate deploy` applies any pending migrations to Neon. No manual migration step is ever needed.
+- `SCOPES` is set here (non-sensitive), secrets are set via `flyctl secrets` (sensitive).
+
+### 5. `.dockerignore`
+
+Keep the image slim and prevent secrets from being copied in:
+
+```
+.cache
+build
+node_modules
+.git
+.gitignore
+.env
+.env.*
+.shopify
+extensions/*/target
+extensions/*/node_modules
+prisma/dev.sqlite
+npm-debug.log
+.DS_Store
+README.md
+CHANGELOG.md
+```
+
+Critical: `.env` and `.env.*` must be ignored — secrets live on Fly, not in the image.
+
+### 6. Deploy via Fly CLI (recommended)
+
 ```bash
-shopify app deploy
+# Install CLI
+brew install flyctl            # macOS
+# curl -L https://fly.io/install.sh | sh  # Linux / WSL
+
+# Authenticate
+flyctl auth login              # opens browser
+
+# Launch the app (no deploy yet — we set secrets first)
+flyctl launch \
+  --no-deploy \
+  --copy-config \
+  --name combined-discount-treelogy \
+  --region sin
+```
+
+Answer the interactive prompts:
+
+| Prompt                                                 | Answer |
+|--------------------------------------------------------|--------|
+| Copy existing `fly.toml` configuration?                | **Y**  |
+| Tweak settings before proceeding?                      | **N**  |
+| Switch to a region that supports Managed Postgres?     | **N**  (we use Neon) |
+| Set up a Postgresql database now?                      | **N**  |
+| Set up an Upstash Redis database now?                  | **N**  |
+| Create `.dockerignore` from `.gitignore`?              | **N**  (we already have one) |
+
+About the `"This organization has no payment method, turning off high availability"` warning: it's not a blocker — HA is orthogonal, and `min_machines_running = 0` doesn't use it anyway. Fly will require a credit card to actually serve traffic, but you can add it later via `flyctl dashboard` → Billing.
+
+### 7. Set secrets
+
+All values that must not land in git or image layers:
+
+```bash
+flyctl secrets set \
+  SHOPIFY_API_KEY="<client_id from Partners>" \
+  SHOPIFY_API_SECRET="<client_secret from Partners>" \
+  DATABASE_URL="postgresql://<user>:<pw>@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require" \
+  SHOPIFY_APP_URL="https://combined-discount-treelogy.fly.dev"
+```
+
+- `SHOPIFY_API_KEY` = client ID (not the app name).
+- `SHOPIFY_API_SECRET` = client secret (starts with `shpss_…`).
+- `SHOPIFY_APP_URL` starts as a guess — Fly assigns `https://<app-name>.fly.dev` by default. You'll confirm the real URL after the first deploy and update both here and in Shopify Partners.
+
+### 8. Deploy
+
+```bash
+flyctl deploy
+```
+
+Fly will:
+
+1. Build the Docker image (Node install + `prisma generate` + `npm run build`).
+2. Push it to the Fly registry.
+3. Run `npx prisma migrate deploy` against Neon (applies the initial `Session` table migration).
+4. Roll out a new machine serving port 3000 behind HTTPS.
+
+After success:
+
+```bash
+flyctl status                  # should show a running machine
+flyctl logs                    # tail logs
+curl -I https://combined-discount-treelogy.fly.dev/    # should be 200 or 302
+```
+
+### 9. Update Shopify Partners with the Fly URL
+
+If the URL you set in `SHOPIFY_APP_URL` doesn't match the real Fly hostname, fix it now — otherwise OAuth will reject the callback.
+
+```bash
+# If it differs, update:
+flyctl secrets set SHOPIFY_APP_URL="https://combined-discount-treelogy.fly.dev"
+```
+
+Then in **Partners Dashboard → Apps → <your app> → Configuration**, set:
+
+- **App URL**: `https://combined-discount-treelogy.fly.dev/`
+- **Allowed redirection URL(s)**:
+  - `https://combined-discount-treelogy.fly.dev/auth/callback`
+  - `https://combined-discount-treelogy.fly.dev/auth/shopify/callback`
+  - `https://combined-discount-treelogy.fly.dev/api/auth/callback`
+
+Or edit `shopify.app.toml` locally:
+
+```toml
+application_url = "https://combined-discount-treelogy.fly.dev/"
+
+[auth]
+redirect_urls = [
+  "https://combined-discount-treelogy.fly.dev/auth/callback",
+  "https://combined-discount-treelogy.fly.dev/auth/shopify/callback",
+  "https://combined-discount-treelogy.fly.dev/api/auth/callback"
+]
+```
+
+### 10. Deploy the Shopify app extension
+
+With the host live, publish the function + config to Shopify:
+
+```bash
+shopify app deploy --force
 ```
 
 This pushes:
 
-- A new app version registering the function
-- The declared metafields + scopes
-- Any active `shopify.app.toml` config (URLs, webhooks)
+- The compiled wasm function
+- Scopes + metafield definitions
+- The updated `application_url` and redirect URLs
 
-Install or upgrade the app on a production store. The embedded admin is served from whatever host you deploy the React Router app to — see the [Shopify launch docs](https://shopify.dev/docs/apps/launch/deployment) for Fly.io / Google Cloud Run / Render / manual hosting.
+### 11. Install on your store
 
-### Production session storage
+Generate an install link from the Partners dashboard (or run `shopify app dev` once against the target store to trigger the install flow). After OAuth completes, navigate to **Apps → Combined Discount** in the Shopify admin. The dashboard should load.
 
-This template uses Prisma + SQLite (`prisma/schema.prisma`) for the CLI-session table. For multi-instance production, swap the datasource to MySQL / PostgreSQL. See `@shopify/shopify-app-session-storage-prisma` for alternatives.
+### Alternative: Deploy via Fly's GitHub UI
+
+If you'd rather not use the CLI, `fly.io/launch` → **Launch an App from GitHub** reads the same `fly.toml` + `Dockerfile` and deploys on push. You'll need to:
+
+- Set the env vars / secrets manually in the "New environment variable" section of the launch form
+- Uncheck "Managed Postgres" (we use Neon)
+- Leave **Working directory** and **Config path** empty (defaults to repo root where `fly.toml` lives)
+- Click Deploy — if it fails with `Failed to create app`, the app name is already taken; rename `app = "…"` in `fly.toml`, commit, push, retry
+
+### Post-deploy smoke test
+
+1. **Install the app** on a dev store via the Partners install link.
+2. **Open Apps → Combined Discount.** Dashboard loads; function ID appears in `/app/discounts` Debug aside.
+3. **Create a discount** (e.g. free shipping + BXGY) at `/app/combined-discount`.
+4. **Paste the UTM snippet** into `theme.liquid`, visit `?utm_campaign=summer-sale`, add an item, check `/cart.js` shows the attribute.
+5. **Checkout** with the code you created — discount should apply.
+
+### Cost ballpark
+
+| Resource                                 | Cost / month |
+|------------------------------------------|--------------|
+| Fly.io 512 MB shared-cpu-1x, idle-stop   | $1–3 (pay-per-second) |
+| Neon free tier (0.5 GB, auto-pause)      | $0           |
+| **Total**                                | **$1–3**     |
+
+Usage-based pricing on Fly means rarely-used admin apps effectively cost pennies. If you hit Neon's free-tier compute limit, upgrade to their $19/mo tier.
+
+### Why not Fly Managed Postgres?
+
+Fly's Managed Postgres starts at ~$38/mo for the smallest HA cluster. For session storage (low IOPS, < 1 MB of data), that's massive overkill. Neon's free tier covers this workload forever.
+
+### Production session storage notes
+
+`@shopify/shopify-app-session-storage-prisma` uses the `Session` table defined in `prisma/schema.prisma`. Any Postgres-compatible DB works — Neon is just the cheapest. If you outgrow it, point `DATABASE_URL` at any other managed Postgres (Supabase, RDS, Cloud SQL, Planetscale+pglite, etc.) and re-run `flyctl deploy` — the `release_command` will migrate the new DB automatically.
 
 ---
 
@@ -610,6 +888,47 @@ The UI clamps on every keystroke and `buildConfigAndClasses` clamps again on sub
 ### Unknown import: `shopify_function_v2::shopify_function_output_new_object`
 
 CLI's `function-runner-9.1.2` can't execute the v2 wasm directly. Use the trampoline (see [Testing the function locally](#testing-the-function-locally)).
+
+### Fly: `Failed to create app. Please try again.`
+
+The `app = "…"` name in `fly.toml` is globally taken. Rename to something more specific (e.g. `combined-discount-<yourorg>`), commit + push, retry.
+
+### Fly: `flyctl launch` prompts "switch region for Managed Postgres?"
+
+Answer **N**. We use Neon (external), not Fly Managed Postgres — the region doesn't need to support it.
+
+### Fly: `This organization has no payment method, turning off high availability`
+
+Not a blocker. HA is orthogonal to our setup (`min_machines_running = 0` doesn't use HA). Add a credit card via `flyctl dashboard` → Billing when Fly actually demands it.
+
+### Neon: `Error: P1001: Can't reach database server`
+
+- **Missing `?sslmode=require`**: Neon only accepts TLS. Append it to `DATABASE_URL`.
+- **Compute paused**: Neon auto-pauses on inactivity, first connect takes ~1 s. Retry.
+- **Wrong region**: not a connection issue but hurts latency. Put Neon in the same region as Fly (e.g. both `ap-southeast-1`).
+
+### Fly deploy: `Error: P3009 migrate found failed migrations`
+
+A previous migration run failed mid-flight. Mark it as rolled back:
+
+```bash
+flyctl ssh console -C "npx prisma migrate resolve --rolled-back <migration-name>"
+flyctl deploy
+```
+
+### OAuth: `redirect_uri is not whitelisted`
+
+`SHOPIFY_APP_URL` on Fly, `application_url` in `shopify.app.toml`, and the redirect URLs in Partners must all agree. Run `shopify app deploy --force` after updating `shopify.app.toml`.
+
+### Embedded admin shows white screen / infinite redirect
+
+Usually means the session DB isn't reachable or the app URL is stale:
+
+```bash
+flyctl logs                          # look for Prisma errors or OAuth loops
+flyctl secrets list                  # verify DATABASE_URL + SHOPIFY_APP_URL
+flyctl ssh console -C "npx prisma migrate status"  # should say "up to date"
+```
 
 ---
 
