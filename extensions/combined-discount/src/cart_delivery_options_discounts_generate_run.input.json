@@ -1,0 +1,15 @@
+{
+  "cart": {
+    "deliveryGroups": [
+      {
+        "deliveryOptions": [
+          { "handle": "standard" },
+          { "handle": "express" }
+        ]
+      }
+    ]
+  },
+  "discount": {
+    "discountClasses": ["ORDER", "SHIPPING"]
+  }
+}

@@ -1,0 +1,26 @@
+api_version = "2025-10"
+
+[[extensions]]
+name = "combined-discount"
+handle = "combined-discount"
+uid = "bd59ac52-aa16-4bd5-a948-53152942b6571736d273"
+type = "function"
+description = "One discount code that applies a fixed amount off AND free shipping"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart_lines_discounts_generate_run"
+
+  [[extensions.targeting]]
+  target = "cart.delivery-options.discounts.generate.run"
+  input_query = "src/cart_delivery_options_discounts_generate_run.graphql"
+  export = "cart_delivery_options_discounts_generate_run"
+
+  [extensions.build]
+  command = "cargo build --target=wasm32-unknown-unknown --release"
+  path = "target/wasm32-unknown-unknown/release/combined_discount.wasm"
+
+  [[extensions.metafields]]
+  namespace = "$app"
+  key = "function-configuration"

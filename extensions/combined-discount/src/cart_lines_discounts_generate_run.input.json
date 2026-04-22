@@ -1,0 +1,14 @@
+{
+  "cart": {
+    "lines": [
+      {
+        "id": "gid://shopify/CartLine/1",
+        "cost": { "subtotalAmount": { "amount": "250000.0" } }
+      }
+    ]
+  },
+  "discount": {
+    "discountClasses": ["ORDER", "SHIPPING"],
+    "metafield": { "jsonValue": { "amountOff": 100000.0 } }
+  }
+}

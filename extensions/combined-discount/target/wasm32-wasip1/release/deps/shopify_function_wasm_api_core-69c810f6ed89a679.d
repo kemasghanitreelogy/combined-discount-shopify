@@ -1,0 +1,9 @@
+/Users/kemasghani/Documents/combined-discount-shopify/extensions/combined-discount/target/wasm32-wasip1/release/deps/shopify_function_wasm_api_core-69c810f6ed89a679.d: /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/lib.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/read.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/write.rs
+
+/Users/kemasghani/Documents/combined-discount-shopify/extensions/combined-discount/target/wasm32-wasip1/release/deps/libshopify_function_wasm_api_core-69c810f6ed89a679.rlib: /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/lib.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/read.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/write.rs
+
+/Users/kemasghani/Documents/combined-discount-shopify/extensions/combined-discount/target/wasm32-wasip1/release/deps/libshopify_function_wasm_api_core-69c810f6ed89a679.rmeta: /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/lib.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/read.rs /Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/write.rs
+
+/Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/lib.rs:
+/Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/read.rs:
+/Users/kemasghani/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/shopify_function_wasm_api_core-0.2.0/src/write.rs:
