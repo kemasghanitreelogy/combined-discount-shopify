@@ -1,3 +1,15 @@
 .cache
 build
 node_modules
+.git
+.gitignore
+.env
+.env.*
+.shopify
+extensions/*/target
+extensions/*/node_modules
+prisma/dev.sqlite
+npm-debug.log
+.DS_Store
+README.md
+CHANGELOG.md
