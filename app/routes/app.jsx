@@ -4,7 +4,35 @@ import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
 
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
+  const url = new URL(request.url);
+  // eslint-disable-next-line no-undef
+  console.log("[app.jsx] LOADER start", {
+    path: url.pathname,
+    hasIdToken: url.searchParams.has("id_token"),
+    hasShop: url.searchParams.has("shop"),
+    embedded: url.searchParams.get("embedded"),
+  });
+  try {
+    const result = await authenticate.admin(request);
+    // eslint-disable-next-line no-undef
+    console.log("[app.jsx] auth SUCCESS", {
+      shop: result?.session?.shop,
+      hasAccessToken: !!result?.session?.accessToken,
+    });
+  } catch (e) {
+    if (e instanceof Response) {
+      // eslint-disable-next-line no-undef
+      console.log("[app.jsx] auth THROWN RESPONSE", {
+        status: e.status,
+        location: e.headers.get("location"),
+        reauth: e.headers.get("x-shopify-api-request-failure-reauthorize"),
+      });
+    } else {
+      // eslint-disable-next-line no-undef
+      console.error("[app.jsx] auth THROWN ERROR", e?.message, e?.stack);
+    }
+    throw e;
+  }
 
   // eslint-disable-next-line no-undef
   return { apiKey: process.env.SHOPIFY_API_KEY || "" };
