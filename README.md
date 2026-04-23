@@ -39,34 +39,99 @@ Everything is driven by a single Shopify Function (Rust) plus an embedded admin 
 ## Architecture
 
 ```
-┌─────────────────────────┐          ┌──────────────────────────┐
-│  Merchant (admin UI)    │          │  Shopify admin           │
-│  React Router 7 routes  │ mutation │  discountCode/Automatic  │
-│  @ /app/…               ├─────────►│  AppCreate / AppUpdate   │
-│  Polaris web components │          │                          │
-└──────────┬──────────────┘          └───────────┬──────────────┘
-           │                                     │
-           │                                     │  functionId + metafield
-           │                                     ▼
-           │                          ┌──────────────────────────┐
-           │                          │  Shopify Function        │
-           │                          │  combined-discount (Rust)│
-           │                          │  two targets             │
-           │                          └───────────┬──────────────┘
-           │                                      │
-           ▼                                      ▼
-┌─────────────────────────┐          ┌──────────────────────────┐
-│  Customer storefront    │ cart     │  Checkout                │
-│  theme.liquid snippet   │ attrs    │  applies operations      │
-│  captures utm_campaign  ├─────────►│  from function output    │
-└─────────────────────────┘          └──────────────────────────┘
+                                       ┌─────────────────────────────────┐
+                                       │ Shopify admin iframe            │
+                                       │  https://admin.shopify.com/...  │
+                                       │  /apps/<app-handle>             │
+                                       └─────────────┬───────────────────┘
+                                                     │ loads iframe src:
+                                                     │ <appUrl>/app?embedded=1
+                                                     │   &id_token=<JWT>
+                                                     │   &host=<b64>&shop=…
+                                                     ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│ Fly.io machine — combined-discount-shopify.fly.dev (Node 20)              │
+│                                                                           │
+│   ┌───────────────────────────────────────────────────────────────────┐   │
+│   │  React Router 7 + @shopify/shopify-app-react-router v1.2         │   │
+│   │                                                                   │   │
+│   │  Request flow                                                     │   │
+│   │  ─────────────                                                    │   │
+│   │  1. GET /?shop=X         → 302 to /app?shop=X                     │   │
+│   │  2. GET /app?id_token=X  → authenticate.admin(request)            │   │
+│   │       ├── token valid → token-exchange → session row (Neon)       │   │
+│   │       │   returns 200 HTML (embedded app)                         │   │
+│   │       └── token invalid / no session →                            │   │
+│   │            302 to /auth/session-token?shopify-reload=/app         │   │
+│   │  3. GET /auth/session-token → 200 App Bridge HTML                 │   │
+│   │       App Bridge reads shopify-reload, fetches fresh id_token     │   │
+│   │       from Shopify admin, reloads iframe → step 2                 │   │
+│   │                                                                   │   │
+│   │  Routes: /app._index, /app.combined-discount, /app.discounts, …   │   │
+│   │  Polaris web components (no import — global <s-…> tags)           │   │
+│   └────────────┬──────────────────────────────────┬───────────────────┘   │
+└────────────────┼──────────────────────────────────┼───────────────────────┘
+                 │                                  │
+                 │ PrismaSessionStorage             │ admin GraphQL mutations
+                 │ CRUD on Session row              │ (with session.accessToken)
+                 ▼                                  ▼
+     ┌───────────────────────┐       ┌─────────────────────────────────────┐
+     │  Neon Postgres        │       │  Shopify admin API                  │
+     │  ep-*.aws.neon.tech   │       │  discountCodeApp{Create,Update}     │
+     │  Session table        │       │  discountAutomaticApp{Create,…}     │
+     └───────────────────────┘       │  discountCodeDelete, nodes(ids:)    │
+                                     └─────────────────┬───────────────────┘
+                                                       │ writes discount node +
+                                                       │ $app/function-configuration
+                                                       │ metafield
+                                                       ▼
+                                     ┌─────────────────────────────────────┐
+                                     │  Shopify checkout                   │
+                                     │  Invokes Shopify Function (wasm)    │
+                                     │  hosted by Shopify itself — NOT Fly │
+                                     │                                     │
+                                     │  extensions/combined-discount       │
+                                     │  Rust → wasm32-unknown-unknown      │
+                                     │  Two targets (cart.lines + delivery)│
+                                     │  Reads metafield.jsonValue +        │
+                                     │  cart.attribute(key:"utm_campaign") │
+                                     │  Emits orderDiscountsAdd /          │
+                                     │  productDiscountsAdd /              │
+                                     │  deliveryDiscountsAdd               │
+                                     └─────────────────────────────────────┘
+                                                       ▲
+                                                       │ cart.attributes.utm_campaign
+                                                       │
+                                     ┌─────────────────┴───────────────────┐
+                                     │  Customer storefront                │
+                                     │  theme.liquid <script> snippet:     │
+                                     │    URL ?utm_campaign=X              │
+                                     │      → localStorage (30 min TTL)    │
+                                     │      → POST /cart/update.js         │
+                                     │        { attributes: { utm_…: X }}  │
+                                     └─────────────────────────────────────┘
 ```
 
-### Three moving parts
+### Four moving parts
 
-1. **Shopify Function** (`extensions/combined-discount/`) — pure Rust compiled to `wasm32-unknown-unknown`. Reads the discount's JSON metafield, the cart's `utm_campaign` attribute, and returns operations for the checkout.
-2. **Admin UI** (`app/routes/app.*.jsx`) — embedded admin app. Create, list, view, edit, delete combined discounts. Calls Shopify admin GraphQL mutations to persist both the discount and its metafield in one round-trip.
-3. **Storefront snippet** — ~30 lines of JavaScript you paste into `theme.liquid`. Captures UTM query params, persists them to `localStorage` (30-minute TTL), and writes them to the cart's attributes. The function reads `cart.attributes.utm_campaign` to gate on campaigns.
+1. **Shopify Function** (`extensions/combined-discount/`) — pure Rust compiled to `wasm32-unknown-unknown`. **Hosted and executed by Shopify at checkout**, not on your Fly machine. Reads the discount's JSON metafield, the cart's `utm_campaign` attribute, and returns operations for the checkout.
+2. **Admin UI** (`app/routes/app.*.jsx`) — embedded admin React Router app, hosted on Fly.io. Create, list, view, edit, delete combined discounts. Calls Shopify admin GraphQL mutations to persist both the discount and its metafield in one round-trip.
+3. **Session storage** (Neon Postgres) — `PrismaSessionStorage` writes one row per installed shop after the token-exchange flow completes. Without this row, every `authenticate.admin()` call fails and the admin iframe shows a blank screen.
+4. **Storefront snippet** — ~30 lines of JavaScript you paste into `theme.liquid`. Captures UTM query params, persists them to `localStorage` (30-minute TTL), and writes them to the cart's attributes. The function reads `cart.attributes.utm_campaign` to gate on campaigns.
+
+### Authentication flow (embedded admin)
+
+This app uses **token exchange** auth (via `@shopify/shopify-app-react-router` v1.2). Understanding this flow matters because the **most common deployment bug — a blank admin iframe — is always a broken token-exchange cycle** (see [Troubleshooting → blank iframe / infinite redirect](#embedded-admin-shows-blank-iframe--infinite-redirect-loop)).
+
+1. Shopify admin iframe loads `https://<appUrl>/app?embedded=1&id_token=<JWT>&host=<base64>&shop=<shop>.myshopify.com&…`
+2. The `/app` loader calls `authenticate.admin(request)`, which:
+   - Extracts `id_token` from query string
+   - Validates the JWT's signature using `apiSecretKey` and checks `aud` against `apiKey`
+   - If the `id_token` is missing or invalid → throws a 302 to `/auth/session-token?shopify-reload=<original-url-minus-id_token>`
+   - If valid but no live session exists in Neon → performs **token exchange** with Shopify's OAuth endpoint to get an offline access token, stores it as a new Session row, then returns the app context
+3. `/auth/session-token` returns a minimal HTML page containing the App Bridge script. App Bridge reads the `shopify-reload` URL, requests a fresh `id_token` from the parent Shopify admin, and reloads the iframe to the `shopify-reload` URL with that new token → back to step 2 (this time valid).
+
+The critical invariant: **`apiKey` in `shopifyApp()` must exactly match the `aud` claim in the `id_token`**. If it doesn't (even a trailing space / newline in the env var), every token validation fails and steps 2 ↔ 3 loop forever.
 
 ### Why two function targets
 
@@ -624,14 +689,17 @@ CMD ["npm", "run", "docker-start"]
 ### 4. `fly.toml`
 
 ```toml
-app = "combined-discount-treelogy"
+app = "combined-discount-shopify"
 primary_region = "sin"
 
 [build]
 
+[deploy]
+  release_command = "npx prisma migrate deploy"
+
 [env]
-  PORT = "3000"
   NODE_ENV = "production"
+  PORT = "3000"
   SCOPES = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts"
 
 [http_service]
@@ -646,13 +714,11 @@ primary_region = "sin"
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
-
-[deploy]
-  release_command = "npx prisma migrate deploy"
+  memory_mb = 512
 ```
 
-- **`app`** must be globally unique across all of Fly.io. If you see `Failed to create app`, rename this to something more specific (e.g. `combined-discount-<yourorg>`).
-- **`auto_stop_machines` / `min_machines_running = 0`** stops the VM when idle, so you only pay while the admin is actively loading. Cold start is ~1–2 s, acceptable for admin use.
+- **`app`** must be globally unique across all of Fly.io. If you see `Failed to create app`, rename this to something more specific (e.g. `combined-discount-<yourorg>`). Note: when launching via Fly's GitHub UI flow, Fly may override this field with the repo name — always verify the actual hostname via `flyctl status` after launch.
+- **`auto_stop_machines` / `min_machines_running = 0`** stops the VM when idle, so you only pay while the admin is actively loading. Cold start is ~5 s (Node startup + Prisma engine), acceptable for admin-only use.
 - **`release_command`** runs before each new release replaces the running machine — `prisma migrate deploy` applies any pending migrations to Neon. No manual migration step is ever needed.
 - `SCOPES` is set here (non-sensitive), secrets are set via `flyctl secrets` (sensitive).
 
@@ -694,7 +760,7 @@ flyctl auth login              # opens browser
 flyctl launch \
   --no-deploy \
   --copy-config \
-  --name combined-discount-treelogy \
+  --name combined-discount-shopify \
   --region sin
 ```
 
@@ -717,15 +783,21 @@ All values that must not land in git or image layers:
 
 ```bash
 flyctl secrets set \
-  SHOPIFY_API_KEY="<client_id from Partners>" \
-  SHOPIFY_API_SECRET="<client_secret from Partners>" \
+  SHOPIFY_API_KEY=<client_id from Partners> \
+  SHOPIFY_API_SECRET=<client_secret from Partners> \
   DATABASE_URL="postgresql://<user>:<pw>@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require" \
-  SHOPIFY_APP_URL="https://combined-discount-treelogy.fly.dev"
+  SHOPIFY_APP_URL="https://combined-discount-shopify.fly.dev"
 ```
 
-- `SHOPIFY_API_KEY` = client ID (not the app name).
+- `SHOPIFY_API_KEY` = client ID (not the app name). **Do not wrap in quotes if copy-pasting from the Shopify Dev Dashboard** — some copy sources append trailing whitespace that breaks JWT audience validation. See [blank iframe troubleshooting](#embedded-admin-shows-blank-iframe--infinite-redirect-loop).
 - `SHOPIFY_API_SECRET` = client secret (starts with `shpss_…`).
 - `SHOPIFY_APP_URL` starts as a guess — Fly assigns `https://<app-name>.fly.dev` by default. You'll confirm the real URL after the first deploy and update both here and in Shopify Partners.
+- Verify secret length immediately after setting:
+  ```bash
+  flyctl ssh console -a <fly-app> -C \
+    'node -e "console.log(process.env.SHOPIFY_API_KEY.length)"'
+  ```
+  Must return exactly `32`. Anything else = whitespace bug → auth loop.
 
 ### 8. Deploy
 
@@ -745,38 +817,36 @@ After success:
 ```bash
 flyctl status                  # should show a running machine
 flyctl logs                    # tail logs
-curl -I https://combined-discount-treelogy.fly.dev/    # should be 200 or 302
+curl -I https://combined-discount-shopify.fly.dev/    # should be 200 or 302
 ```
 
-### 9. Update Shopify Partners with the Fly URL
+### 9. Update Shopify app config with the Fly URL
 
 If the URL you set in `SHOPIFY_APP_URL` doesn't match the real Fly hostname, fix it now — otherwise OAuth will reject the callback.
 
 ```bash
 # If it differs, update:
-flyctl secrets set SHOPIFY_APP_URL="https://combined-discount-treelogy.fly.dev"
+flyctl secrets set SHOPIFY_APP_URL="https://combined-discount-shopify.fly.dev"
 ```
 
-Then in **Partners Dashboard → Apps → <your app> → Configuration**, set:
-
-- **App URL**: `https://combined-discount-treelogy.fly.dev/`
-- **Allowed redirection URL(s)**:
-  - `https://combined-discount-treelogy.fly.dev/auth/callback`
-  - `https://combined-discount-treelogy.fly.dev/auth/shopify/callback`
-  - `https://combined-discount-treelogy.fly.dev/api/auth/callback`
-
-Or edit `shopify.app.toml` locally:
+Then edit `shopify.app.toml` locally:
 
 ```toml
-application_url = "https://combined-discount-treelogy.fly.dev/"
+application_url = "https://combined-discount-shopify.fly.dev"
+
+[build]
+automatically_update_urls_on_dev = false   # prevent shopify app dev from overwriting production URLs
 
 [auth]
 redirect_urls = [
-  "https://combined-discount-treelogy.fly.dev/auth/callback",
-  "https://combined-discount-treelogy.fly.dev/auth/shopify/callback",
-  "https://combined-discount-treelogy.fly.dev/api/auth/callback"
+  "https://combined-discount-shopify.fly.dev/auth/callback",
+  "https://combined-discount-shopify.fly.dev/auth/shopify/callback",
+  "https://combined-discount-shopify.fly.dev/api/auth",
+  "https://combined-discount-shopify.fly.dev/api/auth/callback"
 ]
 ```
+
+> Shopify has migrated app configuration from the legacy Partners dashboard to the **Dev Dashboard** (`dev.shopify.com/dashboard/<org-id>/apps`). The Partners dashboard now only shows distribution/earnings for App Store–listed apps. App URL + redirect URLs for custom apps are managed via `shopify app deploy` → Dev Dashboard, not manual form editing.
 
 ### 10. Deploy the Shopify app extension
 
@@ -889,9 +959,84 @@ The UI clamps on every keystroke and `buildConfigAndClasses` clamps again on sub
 
 CLI's `function-runner-9.1.2` can't execute the v2 wasm directly. Use the trampoline (see [Testing the function locally](#testing-the-function-locally)).
 
+### Embedded admin shows blank iframe / infinite redirect loop
+
+**Symptom:** The app appears in the store's admin sidebar, you click it, and the right-hand panel stays empty. DevTools Network shows repeated `/app?embedded=1&id_token=… → 302 /auth/session-token → 200 → /app?… → 302 …` with no successful 200 on `/app`.
+
+**Root cause (>90% of cases):** `SHOPIFY_API_KEY` set on the host has **trailing whitespace / newline** and doesn't literally equal the JWT `aud` claim. JWT validation fails silently, `authenticate.admin()` throws a redirect, and the cycle never terminates because the library treats it as "invalid session token" not "show error."
+
+**How to diagnose** — add a custom logger to `app/shopify.server.js` and redeploy:
+
+```js
+logger: {
+  level: 4,
+  log: (severity, message) => {
+    console.log(`[shopify-lib sev=${severity}] ${message}`);
+  },
+},
+```
+
+Trigger a page load and tail `flyctl logs` for lines like:
+
+```
+[shopify-app/DEBUG] Failed to validate session token: Session token had invalid API key
+```
+
+That message is always the signature of this bug — it is *not* saying the env var is missing, it is saying `apiKey !== JWT.aud`.
+
+**How to confirm it is whitespace** — SSH into the machine and compare length:
+
+```bash
+flyctl ssh console -a <fly-app> -C \
+  'node -e "const k=process.env.SHOPIFY_API_KEY; console.log(k.length, JSON.stringify(k));"'
+```
+
+Shopify client IDs are exactly **32 lowercase hex characters**. Any other length is the bug.
+
+**Fix** — re-set the secret without quotes or copy-pasted whitespace:
+
+```bash
+flyctl secrets set SHOPIFY_API_KEY=<32-char-client-id> -a <fly-app>
+```
+
+Note: no `"` wrapping in the shell, and pipe the value from your clipboard carefully — some copy sources (Shopify dashboard "Copy" button, Notion, Slack) append a trailing newline.
+
+**Verify session row now writes after reload:**
+
+```bash
+flyctl ssh console -a <fly-app> -C \
+  'node -e "const{PrismaClient}=require(\"@prisma/client\"); new PrismaClient().session.count().then(c=>{console.log(\"sessions:\",c); process.exit(0)})"'
+```
+
+After a successful reload this should return 1+, and the iframe renders the dashboard.
+
+Remove the debug `logger` config once confirmed — it logs every JWT to stdout, which is noisy for production.
+
 ### Fly: `Failed to create app. Please try again.`
 
 The `app = "…"` name in `fly.toml` is globally taken. Rename to something more specific (e.g. `combined-discount-<yourorg>`), commit + push, retry.
+
+### Browser: `<host>.fly.dev's server IP address could not be found`
+
+Your local DNS (router / Chrome / macOS) cached the `NXDOMAIN` response from before the Fly app was created. The domain resolves fine from public resolvers but your system keeps the negative cache.
+
+Verify whether public DNS can resolve it:
+
+```bash
+dig @8.8.8.8 +short <fly-app>.fly.dev   # should return a Fly IP
+host <fly-app>.fly.dev                  # may still return NXDOMAIN if cached
+```
+
+Fix:
+
+1. **macOS**: flush DNS cache
+   ```bash
+   sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
+   ```
+2. **Chrome**: visit `chrome://net-internals/#dns` → **Clear host cache**
+3. **If still failing**: add `8.8.8.8`, `8.8.4.4`, `1.1.1.1` to your macOS DNS servers (System Settings → Network → Wi-Fi → Details → DNS → `+`). Your router's DNS cache is TTL-bound and will catch up eventually, but this gets you unblocked immediately.
+
+Other computers reaching the app are unaffected — this is purely local cache.
 
 ### Fly: `flyctl launch` prompts "switch region for Managed Postgres?"
 
