@@ -2,11 +2,11 @@
 
 client_id = "fb959e692364c4077d75bd1908f8c38f"
 name = "Combined Discount"
-application_url = "https://example.com"
+application_url = "https://combined-discount-shopify.fly.dev"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
 include_config_on_deploy = true
 
 [webhooks]
@@ -25,7 +25,12 @@ api_version = "2026-07"
 scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://combined-discount-shopify.fly.dev/auth/callback",
+  "https://combined-discount-shopify.fly.dev/auth/shopify/callback",
+  "https://combined-discount-shopify.fly.dev/api/auth",
+  "https://combined-discount-shopify.fly.dev/api/auth/callback"
+]
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
