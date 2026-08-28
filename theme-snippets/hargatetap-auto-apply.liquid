@@ -1,0 +1,124 @@
+{% comment %}
+  HARGATETAP — auto-apply kode diskon saat checkout
+  ------------------------------------------------
+  Tempel tepat sebelum </body> di theme.liquid.
+
+  Cara kerja:
+    1. Pelanggan membuka link kampanye. Shopify memasang kode pertama lewat
+       route /discount/... lalu melempar balik ke toko dengan penanda
+       ?hargatetap=1.
+    2. Script menyimpan penanda itu di localStorage.
+    3. Saat pelanggan menekan checkout, script membaca isi keranjang, memilih
+       kode yang relevan saja, lalu mengarahkan lewat /discount/<kode>?redirect=/checkout
+       sehingga Shopify yang memasang diskonnya.
+
+  Link kampanye yang dibagikan:
+    https://treelogy.com/discount/HARGATETAP?redirect=%2F%3Fhargatetap%3D1
+
+  PENTING
+    Script ini TIDAK mengubah harga. Ia hanya memasang kode diskon asli.
+    Potongan tetap dihitung server Shopify, dan hanya berlaku untuk pelanggan
+    di dalam segment "HARGATETAP eligible" — pembeli sebelum 2026-09-01 yang
+    jatah 3 ordernya belum habis. Pelanggan di luar segment boleh saja membawa
+    kodenya; Shopify akan menolaknya.
+{% endcomment %}
+
+<script>
+(function () {
+  var FLAG_KEY = 'treelogy_hargatetap';
+  var TTL_MS = 30 * 24 * 60 * 60 * 1000;   // 30 hari
+  var MARKER = 'hargatetap';
+  var MAX_CODES = 5;                        // batas Shopify: 5 kode per order
+
+  // variantId -> { code, amount }. Urutan tidak penting; prioritas dihitung
+  // dari amount saat keranjang melebihi batas kode.
+  var CODES = {
+    '44527085617340': { code: 'HARGATETAP',  amount:  65000 },
+    '44527085650108': { code: 'HARGATETAP2', amount: 105000 },
+    '47255408378044': { code: 'HARGATETAP3', amount: 180000 },
+    '44527088435388': { code: 'HARGATETAP4', amount:  50000 },
+    '44314284753084': { code: 'HARGATETAP5', amount:  85000 },
+    '44314284785852': { code: 'HARGATETAP6', amount: 155000 }
+  };
+
+  function activate() {
+    try { localStorage.setItem(FLAG_KEY, JSON.stringify({ at: Date.now() })); } catch (e) {}
+  }
+
+  function isActive() {
+    try {
+      var raw = localStorage.getItem(FLAG_KEY);
+      if (!raw) return false;
+      var obj = JSON.parse(raw);
+      if (!obj || !obj.at || Date.now() - obj.at > TTL_MS) {
+        localStorage.removeItem(FLAG_KEY);
+        return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 1. Tangkap penanda dari link kampanye.
+  try {
+    if (new URLSearchParams(window.location.search).get(MARKER)) activate();
+  } catch (e) {}
+
+  if (!isActive()) return;
+
+  // 2. Pilih kode HANYA untuk varian yang benar-benar ada di keranjang, supaya
+  //    tidak menabrak batas 5 kode. Bila lebih dari 5, ambil yang potongannya
+  //    terbesar agar pelanggan kehilangan paling sedikit.
+  function codesForCart(cart) {
+    var picked = {};
+    (cart.items || []).forEach(function (item) {
+      var hit = CODES[String(item.variant_id)];
+      if (hit) picked[hit.code] = hit.amount;
+    });
+    return Object.keys(picked)
+      .sort(function (a, b) { return picked[b] - picked[a]; })
+      .slice(0, MAX_CODES);
+  }
+
+  var handing = false;
+
+  function handOff(event) {
+    if (handing) return;
+    var el = event.target && event.target.closest
+      ? event.target.closest('[name="checkout"], a[href*="/checkout"], button[name="checkout"]')
+      : null;
+    if (!el) return;
+
+    handing = true;
+    event.preventDefault();
+    event.stopPropagation();
+
+    // Gagal-aman: apa pun yang error, lanjutkan checkout normal.
+    var fallback = setTimeout(function () { window.location.href = '/checkout'; }, 2500);
+
+    fetch('/cart.js', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (cart) {
+        clearTimeout(fallback);
+        var codes = codesForCart(cart);
+        if (!codes.length) { window.location.href = '/checkout'; return; }
+        window.location.href =
+          '/discount/' + codes.join(',') + '?redirect=' + encodeURIComponent('/checkout');
+      })
+      .catch(function () {
+        clearTimeout(fallback);
+        window.location.href = '/checkout';
+      });
+  }
+
+  // 3. Tangkap semua jalur checkout: tombol, link, dan submit form keranjang.
+  document.addEventListener('click', handOff, true);
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (form && form.action && form.action.indexOf('/cart') !== -1) {
+      var btn = form.querySelector('[name="checkout"]');
+      if (btn) handOff({ target: btn, preventDefault: function () { event.preventDefault(); },
+                         stopPropagation: function () { event.stopPropagation(); } });
+    }
+  }, true);
+})();
+</script>
