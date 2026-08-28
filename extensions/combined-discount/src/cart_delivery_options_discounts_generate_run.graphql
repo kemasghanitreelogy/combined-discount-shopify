@@ -3,6 +3,14 @@ query Input {
     utmAttribute: attribute(key: "utm_campaign") {
       value
     }
+    buyerIdentity {
+      customer {
+        id
+        state: metafield(namespace: "$app", key: "combined-discount-state") {
+          jsonValue
+        }
+      }
+    }
     deliveryGroups {
       deliveryOptions {
         handle

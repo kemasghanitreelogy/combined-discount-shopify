@@ -7,7 +7,6 @@ embedded = true
 
 [build]
 automatically_update_urls_on_dev = false
-include_config_on_deploy = true
 
 [webhooks]
 api_version = "2026-07"
@@ -20,9 +19,17 @@ api_version = "2026-07"
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
 
+  # Maintains each customer's $app:combined-discount-state metafield, which the
+  # combined-discount Function reads to enforce the "purchased before <date>"
+  # gate and the per-customer order cap. Functions are pure, so they cannot
+  # look up order history themselves.
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create" ]
+  uri = "/webhooks/orders/create"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts,write_customers,read_orders"
 
 [auth]
 redirect_urls = [
@@ -39,6 +46,17 @@ description = "Tracks products created by the Shopify app template for developme
 
   [product.metafields.app.demo_info.access]
   admin = "merchant_read_write"
+
+# Read model the discount Function consumes: first purchase date, per-campaign
+# qualifying purchase date, and per-campaign redemption count.
+[customer.metafields.app.combined-discount-state]
+type = "json"
+name = "Combined Discount customer state"
+description = "Purchase history and redemption counters used by the combined-discount function"
+
+  [customer.metafields.app.combined-discount-state.access]
+  admin = "merchant_read"
+  storefront = "none"
 
 [discount.metafields.app.function-configuration]
 type = "json"

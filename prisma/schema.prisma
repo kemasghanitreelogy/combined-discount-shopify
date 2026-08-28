@@ -11,21 +11,93 @@ datasource db {
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+/// One row per discount the Combined Discount app manages.
+///
+/// `campaignKey` is embedded in the discount's function-configuration metafield
+/// and namespaces that campaign's counters inside each customer's state
+/// metafield, so the Function never needs to know its own discount ID (the
+/// Function input schema does not expose one).
+model DiscountCampaign {
+  id          String  @id @default(cuid())
+  shop        String
+  campaignKey String
+  discountId  String
+  method      String
+  title       String
+  code        String?
+
+  /// JSON arrays of product / variant GIDs whose purchase qualifies a customer
+  /// for the purchase-history gate. Empty means "any purchase qualifies".
+  qualifyingProductIds String @default("[]")
+  qualifyingVariantIds String @default("[]")
+
+  /// Mirrors of the metafield config, so the webhook can decide what to project
+  /// without re-reading every discount from the Admin API on each order.
+  maxOrdersPerCustomer Int?
+  purchasedBefore      String?
+  archived             Boolean @default(false)
+
+  /// Cutoff the last segment backfill actually ran against. If it drifts from
+  /// `purchasedBefore` the projected dates are stale and the merchant is told
+  /// to re-run — the gate fails closed either way, but silently.
+  backfilledCutoff String?
+  backfilledAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, campaignKey])
+  @@unique([shop, discountId])
+  @@index([shop, archived])
+  @@index([shop, title])
+  @@index([shop, code])
+}
+
+/// Ledger of redemptions. This is the source of truth for "works for N separate
+/// orders only"; the customer metafield is a projection of it that the Function
+/// can read. The unique constraint makes webhook replays idempotent.
+model DiscountRedemption {
+  id          String   @id @default(cuid())
+  shop        String
+  campaignKey String
+  customerId  String
+  orderId     String
+  orderedAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@unique([shop, campaignKey, orderId])
+  @@index([shop, campaignKey, customerId])
+}
+
+/// Cache of each customer's projected purchase history, so the webhook can
+/// recompute the state metafield without re-walking order history.
+model CustomerPurchaseFact {
+  id              String    @id @default(cuid())
+  shop            String
+  customerId      String
+  firstPurchaseAt DateTime?
+  /// JSON object: { "<campaignKey>": "YYYY-MM-DD" }
+  qualifiedAt     String    @default("{}")
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([shop, customerId])
 }

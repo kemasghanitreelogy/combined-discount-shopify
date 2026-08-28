@@ -267,7 +267,7 @@ export default function Index() {
         <s-section heading="Setup required">
           <s-box padding="base" border-radius="base" background="subdued">
             <s-paragraph>
-              The combined-discount Shopify Function isn't registered yet. Run{" "}
+              The combined-discount Shopify Function isn&apos;t registered yet. Run{" "}
               <s-text type="strong">shopify app dev</s-text> or{" "}
               <s-text type="strong">shopify app deploy</s-text> to push it, then
               refresh this page.

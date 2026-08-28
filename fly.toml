@@ -14,7 +14,7 @@ primary_region = 'sin'
 [env]
   NODE_ENV = 'production'
   PORT = '3000'
-  SCOPES = 'write_products,write_metaobjects,write_metaobject_definitions,write_discounts'
+  SCOPES = 'write_products,write_metaobjects,write_metaobject_definitions,write_discounts,write_customers,read_orders'
 
 [http_service]
   internal_port = 3000

@@ -22,6 +22,9 @@ database.sqlite
 
 /extensions/*/dist
 
+# Host-target build output from `cargo test`; only the release wasm is tracked.
+/extensions/*/target/debug
+
 # Ignore shopify files created during app dev
 .shopify/*
 .shopify.lock

@@ -50,6 +50,10 @@ module.exports = {
       },
       rules: {
         "react/no-unknown-property": ["error", { ignore: ["variant"] }],
+        // This app declares no PropTypes anywhere, so the rule fires on every
+        // component and drowns out real findings. Prop shapes are documented in
+        // JSDoc on the components that have non-obvious contracts.
+        "react/prop-types": "off",
       },
     },
 
