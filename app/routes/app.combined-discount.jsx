@@ -236,6 +236,11 @@ export const loader = async ({ request }) => {
               endsAt
               discountClasses
               appliesOncePerCustomer
+              combinesWith {
+                orderDiscounts
+                productDiscounts
+                shippingDiscounts
+              }
               codes(first: 1) { nodes { code } }
             }
             ... on DiscountAutomaticApp {
@@ -244,6 +249,11 @@ export const loader = async ({ request }) => {
               startsAt
               endsAt
               discountClasses
+              combinesWith {
+                orderDiscounts
+                productDiscounts
+                shippingDiscounts
+              }
             }
           }
         }
@@ -317,6 +327,9 @@ export const loader = async ({ request }) => {
       startsAt: d.startsAt ? String(d.startsAt).slice(0, 10) : "",
       endsAt: d.endsAt ? String(d.endsAt).slice(0, 10) : "",
       appliesOncePerCustomer: Boolean(d.appliesOncePerCustomer),
+      combinesWithOrder: Boolean(d.combinesWith?.orderDiscounts),
+      combinesWithProduct: Boolean(d.combinesWith?.productDiscounts),
+      combinesWithShipping: Boolean(d.combinesWith?.shippingDiscounts),
       requiredUtmCampaign: config.requiredUtmCampaign || "",
       orderEnabled: Boolean(config.orderAmountOff),
       orderKind: config.orderAmountOff?.isPercentage ? "percentage" : "fixedAmount",
@@ -510,10 +523,18 @@ export const action = async ({ request }) => {
       value: JSON.stringify(config),
     },
   ];
+  // Which other discount classes this one is willing to stack with. Shopify
+  // accepts any combination of the three for an app discount — verified against
+  // the Admin API — so the merchant decides, not us.
+  //
+  // What the merchant should know: product discounts on *separate* cart lines
+  // combine on every plan, but two product discounts on the *same* line need
+  // Shopify Plus. A shopper can also carry at most 5 product/order codes per
+  // order.
   const combinesWith = {
-    orderDiscounts: false,
-    productDiscounts: false,
-    shippingDiscounts: false,
+    orderDiscounts: values.combinesWithOrder === "on",
+    productDiscounts: values.combinesWithProduct === "on",
+    shippingDiscounts: values.combinesWithShipping === "on",
   };
 
   if (method === "automatic") {
@@ -1003,6 +1024,16 @@ export default function CombinedDiscount() {
     edit?.eligibilitySelection ?? [],
   );
 
+  const [combinesWithOrder, setCombinesWithOrder] = useState(
+    edit ? edit.combinesWithOrder : false,
+  );
+  const [combinesWithProduct, setCombinesWithProduct] = useState(
+    edit ? edit.combinesWithProduct : false,
+  );
+  const [combinesWithShipping, setCombinesWithShipping] = useState(
+    edit ? edit.combinesWithShipping : false,
+  );
+
   const [usageLimitEnabled, setUsageLimitEnabled] = useState(
     edit ? edit.usageLimitEnabled : false,
   );
@@ -1132,6 +1163,9 @@ export default function CombinedDiscount() {
       form.set("bxgyGetVariantIds", getIds.variantIds);
     }
     if (shippingEnabled) form.set("shippingEnabled", "on");
+    if (combinesWithOrder) form.set("combinesWithOrder", "on");
+    if (combinesWithProduct) form.set("combinesWithProduct", "on");
+    if (combinesWithShipping) form.set("combinesWithShipping", "on");
     fetcher.submit(form, { method: "POST" });
   };
 
@@ -1317,6 +1351,17 @@ export default function CombinedDiscount() {
             checked={usageLimitEnabled}
             onChange={(e) => setUsageLimitEnabled(e.target.checked)}
           />
+          <s-paragraph tone="neutral">
+            {combinesWithOrder || combinesWithProduct || combinesWithShipping
+              ? `Combines with: ${[
+                  combinesWithProduct ? "product" : null,
+                  combinesWithOrder ? "order" : null,
+                  combinesWithShipping ? "shipping" : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ")} discounts.`
+              : "Exclusive — won't stack with any other discount."}
+          </s-paragraph>
           {usageLimitEnabled ? (
             <s-stack direction="block" gap="base">
               <s-number-field
@@ -1441,6 +1486,57 @@ export default function CombinedDiscount() {
               </s-grid>
             </s-stack>
           ) : null}
+        </s-stack>
+      </s-section>
+
+      <s-section heading="Combine with other discounts">
+        <s-stack direction="block" gap="base">
+          <s-paragraph tone="neutral">
+            Choose which of Shopify&apos;s own discount types this one is allowed to
+            stack with. Leave everything off to make it exclusive — a shopper who
+            uses this discount then can&apos;t also use another.
+          </s-paragraph>
+
+          <s-checkbox
+            label="Combine with product discounts"
+            details="Other discounts on specific products or variants."
+            checked={combinesWithProduct}
+            onChange={(e) => setCombinesWithProduct(e.target.checked)}
+          />
+          <s-checkbox
+            label="Combine with order discounts"
+            details="Discounts taken off the order subtotal."
+            checked={combinesWithOrder}
+            onChange={(e) => setCombinesWithOrder(e.target.checked)}
+          />
+          <s-checkbox
+            label="Combine with shipping discounts"
+            details="Free or reduced shipping offers."
+            checked={combinesWithShipping}
+            onChange={(e) => setCombinesWithShipping(e.target.checked)}
+          />
+
+          <s-box padding="base" border-radius="base" background="subdued">
+            <s-stack direction="block" gap="small-200">
+              <s-heading>What Shopify allows</s-heading>
+              <s-unordered-list>
+                <s-list-item>
+                  Two product discounts land on the same order only when they hit{" "}
+                  <s-text type="strong">different items</s-text>. Stacking two on one
+                  cart line needs Shopify Plus.
+                </s-list-item>
+                <s-list-item>
+                  A shopper can carry at most{" "}
+                  <s-text type="strong">5 product or order codes</s-text> plus 1
+                  shipping code per order.
+                </s-list-item>
+                <s-list-item>
+                  Both sides have to agree — the other discount must also be set to
+                  combine, or neither stacks.
+                </s-list-item>
+              </s-unordered-list>
+            </s-stack>
+          </s-box>
         </s-stack>
       </s-section>
 
