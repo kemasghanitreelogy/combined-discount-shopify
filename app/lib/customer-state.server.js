@@ -1,3 +1,4 @@
+import { adminGraphql } from "./admin-graphql.server";
 import {
   CUSTOMER_STATE_KEY,
   CUSTOMER_STATE_NAMESPACE,
@@ -32,14 +33,11 @@ const WRITE_CUSTOMER_STATE = `#graphql
 
 /** Reads the state document plus the digest needed to write it back safely. */
 export async function readCustomerState(admin, customerId) {
-  const response = await admin.graphql(READ_CUSTOMER_STATE, {
-    variables: {
-      id: customerId,
-      namespace: CUSTOMER_STATE_NAMESPACE,
-      key: CUSTOMER_STATE_KEY,
-    },
+  const json = await adminGraphql(admin, READ_CUSTOMER_STATE, {
+    id: customerId,
+    namespace: CUSTOMER_STATE_NAMESPACE,
+    key: CUSTOMER_STATE_KEY,
   });
-  const json = await response.json();
   if (json?.errors?.length) {
     throw new Error(
       `Reading customer state failed: ${json.errors.map((e) => e.message).join("; ")}`,
@@ -79,22 +77,19 @@ export async function updateCustomerState(admin, customerId, mutate, attempts = 
     }
 
     const serialized = serializeCustomerState(next);
-    const response = await admin.graphql(WRITE_CUSTOMER_STATE, {
-      variables: {
-        metafields: [
-          {
-            ownerId: customerId,
-            namespace: CUSTOMER_STATE_NAMESPACE,
-            key: CUSTOMER_STATE_KEY,
-            type: "json",
-            value: JSON.stringify(serialized),
-            // Omitted on first write: there is no prior value to compare against.
-            ...(compareDigest ? { compareDigest } : {}),
-          },
-        ],
-      },
+    const json = await adminGraphql(admin, WRITE_CUSTOMER_STATE, {
+      metafields: [
+        {
+          ownerId: customerId,
+          namespace: CUSTOMER_STATE_NAMESPACE,
+          key: CUSTOMER_STATE_KEY,
+          type: "json",
+          value: JSON.stringify(serialized),
+          // Omitted on first write: there is no prior value to compare against.
+          ...(compareDigest ? { compareDigest } : {}),
+        },
+      ],
     });
-    const json = await response.json();
     const userErrors = json?.data?.metafieldsSet?.userErrors ?? [];
 
     if (!userErrors.length && !json?.errors?.length) {

@@ -1,4 +1,5 @@
 import db from "../db.server";
+import { syncCampaigns } from "./campaign-sync.server";
 import {
   earlierDay,
   findCampaignState,
@@ -85,9 +86,14 @@ export async function projectOrder({ admin, shop, payload }) {
     return { skipped: "order is not attributable to a customer" };
   }
 
-  const campaigns = await db.discountCampaign.findMany({
-    where: { shop, archived: false },
-  });
+  // Realign code/title from Shopify first: orders can only be matched on those,
+  // and a rename made outside this app would otherwise stop the cap counting
+  // without any error to notice.
+  const campaigns = await syncCampaigns(
+    admin,
+    shop,
+    await db.discountCampaign.findMany({ where: { shop, archived: false } }),
+  );
 
   // --- facts -------------------------------------------------------------
   const existingFact = await db.customerPurchaseFact.findUnique({

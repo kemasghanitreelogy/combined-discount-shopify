@@ -11,6 +11,7 @@ import {
   newCampaignKey,
 } from "../lib/combined-discount.server";
 import { backfillPurchaseHistory } from "../lib/purchase-backfill.server";
+import { reconcileRedemptions } from "../lib/redemption-reconcile.server";
 
 async function fetchProductTitles(admin, ids) {
   if (!ids.length) return { titles: {}, parents: {} };
@@ -417,6 +418,16 @@ export const action = async ({ request }) => {
           },
         ],
       };
+    }
+  }
+
+  // Rebuild the redemption ledger from Shopify's order history.
+  if (values.intent === "reconcile") {
+    try {
+      const result = await reconcileRedemptions({ admin, shop });
+      return { reconcile: result, userErrors: [] };
+    } catch (error) {
+      return { userErrors: [{ message: `Reconcile failed: ${error.message}` }] };
     }
   }
 
@@ -1106,6 +1117,16 @@ export default function CombinedDiscount() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetcher.data, fetcher.state]);
 
+  const isReconciling =
+    ["loading", "submitting"].includes(fetcher.state) &&
+    fetcher.formData?.get("intent") === "reconcile";
+
+  const runReconcile = () => {
+    const form = new FormData();
+    form.set("intent", "reconcile");
+    fetcher.submit(form, { method: "POST" });
+  };
+
   const submit = () => {
     const form = new FormData();
     if (isEditing) form.set("editId", edit.id);
@@ -1372,6 +1393,43 @@ export default function CombinedDiscount() {
                 details="Counted from real orders, so a customer can spread the uses across separate checkouts."
                 onChange={(e) => setMaxOrdersPerCustomer(e.target.value)}
               />
+              <s-box padding="base" border-radius="base" background="subdued">
+                <s-stack direction="block" gap="small-300">
+                  <s-heading>Redemption count</s-heading>
+                  <s-paragraph tone="neutral">
+                    Uses are counted from the orders webhook. If the app was
+                    unreachable when an order came in, Shopify stops retrying after
+                    about four hours and that order is never counted — the cap then
+                    silently allows more orders than you set.
+                  </s-paragraph>
+                  <s-paragraph tone="neutral">
+                    This rebuilds the count from Shopify&apos;s own order history and
+                    also gives back allowance for cancelled orders. Safe to run any
+                    time.
+                  </s-paragraph>
+                  <s-button
+                    onClick={runReconcile}
+                    {...(isReconciling ? { loading: true } : {})}
+                  >
+                    Recount redemptions
+                  </s-button>
+                  {fetcher.data?.reconcile ? (
+                    <s-stack direction="block" gap="small-200">
+                      {fetcher.data.reconcile.campaigns.map((c, i) => (
+                        <s-paragraph key={i}>
+                          {c.skipped
+                            ? `${c.campaignKey}: skipped — ${c.skipped}`
+                            : `${c.code}: ${c.ordersInShopify} order(s) in Shopify, ` +
+                              `${c.added} added, ${c.removedCancelled} cancelled, ` +
+                              `${c.removedOrphaned} stale removed, ` +
+                              `${c.customersRepublished} customer(s) updated.`}
+                        </s-paragraph>
+                      ))}
+                    </s-stack>
+                  ) : null}
+                </s-stack>
+              </s-box>
+
               {isEditing ? (
                 <s-paragraph tone="neutral">
                   Redeemed on{" "}
