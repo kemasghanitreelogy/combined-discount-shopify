@@ -48,6 +48,38 @@ const FIND_CUSTOMER = `#graphql
     }
   }`;
 
+/**
+ * Direct lookups — NOT the search index.
+ *
+ * `customers(query: "email:…")` reads Shopify's search index, which lags a
+ * freshly created customer by seconds. The Workspace creates the customer and
+ * calls us immediately, so the search missed it, we tried customerCreate, and
+ * Shopify answered "Email has already been taken" (seen live, 7 of 14 rows on
+ * the first real import). `customerByIdentifier` and `customer(id:)` read
+ * the primary store and are consistent right away.
+ */
+const CUSTOMER_BY_EMAIL = `#graphql
+  query AdminCustomerByEmail($identifier: CustomerIdentifierInput!) {
+    customerByIdentifier(identifier: $identifier) {
+      id
+      tags
+      defaultEmailAddress {
+        emailAddress
+      }
+    }
+  }`;
+
+const CUSTOMER_BY_ID = `#graphql
+  query AdminCustomerById($id: ID!) {
+    customer(id: $id) {
+      id
+      tags
+      defaultEmailAddress {
+        emailAddress
+      }
+    }
+  }`;
+
 const CREATE_CUSTOMER = `#graphql
   mutation AdminCreateEligibleCustomer($input: CustomerInput!) {
     customerCreate(input: $input) {
@@ -96,14 +128,32 @@ function mapCustomer(node) {
   };
 }
 
-/** Exact-email lookup — the search index can return near matches. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Exact-email lookup: direct identifier read first, search index as a fallback. */
 async function findByEmail(admin, email) {
+  const direct = await adminGraphql(admin, CUSTOMER_BY_EMAIL, {
+    identifier: { emailAddress: email },
+  });
+  throwOnErrors(direct, "customer lookup");
+  if (direct?.data?.customerByIdentifier) return mapCustomer(direct.data.customerByIdentifier);
+
   const json = await adminGraphql(admin, FIND_CUSTOMER, {
     query: `email:"${email.replace(/"/g, "")}"`,
   });
   throwOnErrors(json, "customer lookup");
   const nodes = json?.data?.customers?.nodes ?? [];
   return nodes.map(mapCustomer).find((c) => c.email === email) ?? null;
+}
+
+/** Lookup by GID; only trusted when the record's email is the one requested. */
+async function findById(admin, customerId, email) {
+  const json = await adminGraphql(admin, CUSTOMER_BY_ID, { id: customerId });
+  throwOnErrors(json, "customer lookup");
+  const node = json?.data?.customer;
+  if (!node) return null;
+  const customer = mapCustomer(node);
+  return customer.email === email ? customer : null;
 }
 
 async function createCustomer(admin, { email, firstName, lastName, tags }) {
@@ -119,6 +169,15 @@ async function createCustomer(admin, { email, firstName, lastName, tags }) {
   const payload = json?.data?.customerCreate;
   const userErrors = payload?.userErrors ?? [];
   if (userErrors.length || !payload?.customer) {
+    // "Email has already been taken" means the customer exists but no lookup
+    // saw it yet — re-read directly a few times before giving up.
+    if (userErrors.some((e) => /already been taken/i.test(e?.message ?? ""))) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await sleep(1000 * (attempt + 1));
+        const found = await findByEmail(admin, email);
+        if (found) return found;
+      }
+    }
     throw new GrantError(
       422,
       `customerCreate rejected: ${userErrors.map((e) => e.message).join("; ") || "no customer returned"}`,
@@ -145,7 +204,8 @@ async function ensureTags(admin, customer, wanted) {
  * @param {object} args
  * @param {object} args.admin   offline Admin API client for `shop`
  * @param {string} args.shop    myshopify domain the campaigns belong to
- * @param {object} args.input   { email, firstName?, lastName?, tags?, campaignKeys?, seedDate? }
+ * @param {object} args.input   { email, customerId?, firstName?, lastName?, tags?, campaignKeys?, seedDate? }
+ *   `customerId` (GID) is optional and skips the email lookup when it matches.
  */
 export async function grantEligibleCustomer({ admin, shop, input }) {
   const email = String(input?.email ?? "").trim().toLowerCase();
@@ -178,7 +238,10 @@ export async function grantEligibleCustomer({ admin, shop, input }) {
   }
 
   // --- 2. customer ---------------------------------------------------------
-  let customer = await findByEmail(admin, email);
+  const givenId = typeof input?.customerId === "string" && /^gid:\/\/shopify\/Customer\/\d+$/.test(input.customerId)
+    ? input.customerId
+    : null;
+  let customer = (givenId ? await findById(admin, givenId, email) : null) ?? (await findByEmail(admin, email));
   let created = false;
   if (customer) {
     customer = { ...customer, tags: await ensureTags(admin, customer, tags) };
