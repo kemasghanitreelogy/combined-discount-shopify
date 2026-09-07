@@ -268,19 +268,23 @@ export async function grantEligibleCustomer({ admin, shop, input }) {
     );
   }
 
-  await db.customerPurchaseFact.upsert({
-    where,
-    create: {
-      shop,
-      customerId: customer.id,
-      firstPurchaseAt: new Date(`${firstPurchaseDay}T00:00:00.000Z`),
-      qualifiedAt: JSON.stringify(qualifiedAt),
-    },
-    update: {
-      firstPurchaseAt: new Date(`${firstPurchaseDay}T00:00:00.000Z`),
-      qualifiedAt: JSON.stringify(qualifiedAt),
-    },
-  });
+  const factData = {
+    firstPurchaseAt: new Date(`${firstPurchaseDay}T00:00:00.000Z`),
+    qualifiedAt: JSON.stringify(qualifiedAt),
+  };
+  try {
+    await db.customerPurchaseFact.upsert({
+      where,
+      create: { shop, customerId: customer.id, ...factData },
+      update: factData,
+    });
+  } catch (error) {
+    // Two grants for the same brand-new customer can race the INSERT side of
+    // the upsert (P2002 on the unique key). The row exists now, so a plain
+    // update — with the same earlierDay-merged values — is the right retry.
+    if (error?.code !== "P2002") throw error;
+    await db.customerPurchaseFact.update({ where, data: factData });
+  }
 
   // --- 4. read model -----------------------------------------------------------
   await updateCustomerState(admin, customer.id, (current) => {
