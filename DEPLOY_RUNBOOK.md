@@ -1,5 +1,6 @@
 > **Archived (2026-10-02).** Production no longer runs on Fly.io — it moved to the
-> Treelogy VPS. The current deployment is documented in [`deploy/README.md`](deploy/README.md).
+> Treelogy VPS, and the database from Neon to Supabase. The current deployment is
+> documented in [`deploy/README.md`](deploy/README.md).
 > This runbook is kept for its Shopify/Neon gotchas, which still apply.
 
 # Shopify App → Fly.io + Neon — Deployment Runbook

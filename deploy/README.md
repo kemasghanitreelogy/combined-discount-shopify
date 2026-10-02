@@ -8,7 +8,7 @@ next to the Treelogy services, at **https://discount.treelogy-services.my.id**.
 Shopify ──HTTPS──▶ nginx :443 ──┤        one slot live, the other idle
                                   └─▶ 127.0.0.1:3201  combined-discount@3201  (green)
                                               │
-                                              └──TLS──▶ Neon Postgres (sessions, app data)
+                                              └──TLS──▶ Supabase Postgres (Supavisor session pooler)
 ```
 
 | What | Where |
@@ -58,8 +58,26 @@ kill -9 recovery) — mutates no shop data:
 ./scripts/validate-deploy.sh
 ```
 
+`restart` re-launches the live release on the other slot without rebuilding —
+use it after changing `/etc/combined-discount/env`.
+
 Shopify-side config (URLs, webhooks, scopes) and the discount Function are not part
 of this deploy — they ship with `npm run deploy` (`shopify app deploy`).
+
+## Database
+
+Supabase project **combined-discount** (`vbfxwrlbrkdjovzkxozu`, ap-southeast-1, Pro),
+Postgres 17. The app connects as the dedicated role `combined_discount`, which
+owns the `combined_discount` schema and nothing else: no superuser, no RLS
+bypass, no CREATE on the database or on `public`, and the schema is not exposed
+through the Data API. Migrated from Neon on 2026-10-02 (row counts and per-table
+content hashes verified identical; the Neon database was left read-only).
+
+Migration `20260828000000_combined_discount_campaigns` opens with
+`CREATE SCHEMA IF NOT EXISTS "public"`, which needs database-level CREATE. It is
+already applied; if a future Prisma migration emits the same line, grant
+`CREATE ON DATABASE postgres` to `combined_discount` for that deploy and revoke
+it afterwards rather than widening the role for good.
 
 ## Changing the deploy tooling itself
 

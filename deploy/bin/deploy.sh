@@ -3,6 +3,8 @@
 #
 #   deploy.sh [git-ref]     build <git-ref> (default: main) and make it live
 #   deploy.sh rollback      make the previous release live again (no rebuild)
+#   deploy.sh restart       re-launch the live release on the other slot, e.g. to
+#                           pick up a changed env file — no rebuild, no downtime
 #   deploy.sh status        show the live slot and the available releases
 #
 # Two slots, 127.0.0.1:3200 and :3201, each a combined-discount@<port> unit
@@ -225,6 +227,13 @@ cmd_status() {
   for p in "${PORTS[@]}"; do echo "slot :$p  $(systemctl is-active "$APP@$p" || true)"; done
 }
 
+cmd_restart() {
+  local live; live=$(readlink -f "$CURRENT" 2>/dev/null || true)
+  [[ -n $live && -d $live ]] || die "no live release to restart"
+  log "re-launching $(basename "$live") on the other slot"
+  go_live "$live"
+}
+
 cmd_rollback() {
   local target
   target=$(previous_release)
@@ -285,7 +294,8 @@ prune_releases() {
 
 case ${1:-main} in
   rollback) cmd_rollback ;;
+  restart)  cmd_restart ;;
   status)   cmd_status ;;
-  -h|--help) sed -n '2,6p' "$0" ;;
+  -h|--help) sed -n '2,8p' "$0" ;;
   *)        cmd_deploy "${1:-main}" ;;
 esac

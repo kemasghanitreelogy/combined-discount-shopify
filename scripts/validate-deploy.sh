@@ -25,7 +25,10 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗ %s\033[0m %s\n' "$1" "${2:-}"; }
 gate() { if eval "$2"; then ok "$1"; else bad "$1" "${3:-}"; fi; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
-vps() { ssh -o BatchMode=yes treelogy-vps "$@" 2>/dev/null | grep -v -E 'AUTHORIZED|Terminated|Activity|idcloudhost|___|^ *\||^\s*$'; }
+# One multiplexed connection: a burst of fresh SSH connections trips OpenSSH's
+# per-source penalties and gets reset mid-run.
+vps() { ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath="$HOME/.ssh/cd-%C" -o ControlPersist=120 \
+          treelogy-vps "$@" 2>/dev/null | grep -v -E 'AUTHORIZED|Terminated|Activity|idcloudhost|___|^ *\||^\s*$'; }
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
 header() { curl -sI --max-time 20 "$URL${2:-/}" | tr -d '\r' | grep -i "^$1:" | head -1 | cut -d' ' -f2-; }
 
@@ -131,7 +134,7 @@ gate "G4.5 hashed asset: exactly one immutable Cache-Control ($ASSET)" \
 gate "G4.6 internal /healthz → 200 ok:true (DB reachable)" \
   "vps 'curl -fsS http://127.0.0.1:$LIVE/healthz' | grep -q '\"ok\":true'"
 MIG=$(vps 'cd /opt/combined-discount/current && sudo env $(sudo grep -E "^DATABASE_URL=" /etc/combined-discount/env) runuser -u combined-discount -- env HOME=/opt/combined-discount npx prisma migrate status 2>&1 | grep -c "Database schema is up to date"')
-gate "G4.7 Neon schema up to date with release" "[ '$MIG' = 1 ]"
+gate "G4.7 database schema up to date with release" "[ '$MIG' = 1 ]"
 
 # ───────────────────────────── G5 webhooks ─────────────────────────────
 section "G5 · Webhooks (HMAC)"
