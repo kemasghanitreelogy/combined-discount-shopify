@@ -1,3 +1,7 @@
+> **Archived (2026-10-02).** Production no longer runs on Fly.io — it moved to the
+> Treelogy VPS. The current deployment is documented in [`deploy/README.md`](deploy/README.md).
+> This runbook is kept for its Shopify/Neon gotchas, which still apply.
+
 # Shopify App → Fly.io + Neon — Deployment Runbook
 
 A battle-tested, copy-paste runbook for deploying any Shopify embedded app (React Router / Remix template) onto Fly.io with a Neon Postgres session store. Every gotcha we've hit is encoded here with a concrete verification step — follow in order and you won't spend a day debugging auth loops again.

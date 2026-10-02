@@ -80,7 +80,8 @@ EOF
   # owns. Seed it on a fresh server so the vhost loads before the first deploy.
   local upstream=/etc/nginx/conf.d/$APP-upstream.conf
   [[ -f $upstream ]] || printf '%s\n' "# Managed by $APP-deploy — the live blue/green slot. Do not edit by hand." \
-    'upstream combined_discount {' '    server 127.0.0.1:3200;' '    keepalive 16;' '}' > "$upstream"
+    'upstream combined_discount {' '    server 127.0.0.1:3200;' '    keepalive 16;' '}' \
+    'map $remote_addr $combined_discount_slot {' '    127.0.0.1 $upstream_addr;' '    default   "";' '}' > "$upstream"
 
   install -o root -g root -m 644 "$HERE/nginx/$DOMAIN.conf" "$site"
   ln -sfn "$site" /etc/nginx/sites-enabled/$DOMAIN

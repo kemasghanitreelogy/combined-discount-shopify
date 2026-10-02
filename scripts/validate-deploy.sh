@@ -101,7 +101,7 @@ gate "G3.5 only the live slot listens, on loopback" "[ \"\$(v listen)\" = '127.0
 gate "G3.6 env file root:combined-discount 640" "[ \"\$(v envperm)\" = root:combined-discount:640 ]"
 ORIGIN_MAIN=$(git ls-remote origin refs/heads/main | cut -f1)
 gate "G3.7 live release = origin/main (${ORIGIN_MAIN:0:7})" "[ \"\$(v revision)\" = '$ORIGIN_MAIN' ]"
-gate "G3.8 live release passed build + migrations" "[ \"\$(v deployable)\" = yes ]"
+gate "G3.8 live release marked proven (rollback-eligible)" "[ \"\$(v deployable)\" = yes ]"
 EXPOSURE=$(v exposure)
 gate "G3.9 systemd exposure score ≤ 3.0 (${EXPOSURE:-n/a})" "[ -n '$EXPOSURE' ] && awk -v e='$EXPOSURE' 'BEGIN{exit !(e <= 3.0)}'"
 gate "G3.10 swap enabled"                      "[ -n \"\$(v swap)\" ]"
@@ -126,8 +126,8 @@ APP_CODE=$(code "$URL/app")
 gate "G4.3 /app without session → embedded-auth bounce ($APP_CODE)" "[[ $APP_CODE =~ ^(302|410)$ ]]"
 gate "G4.4 unknown path → 404, not 5xx" "[ \"\$(code $URL/qa-no-such-page)\" = 404 ]"
 ASSET=$(curl -s --max-time 20 "$URL/auth/login" | grep -oE '/assets/[A-Za-z0-9._-]+\.js' | head -1)
-gate "G4.5 hashed asset served immutable ($ASSET)" \
-  "[ -n '$ASSET' ] && curl -sI $URL$ASSET | grep -qi '^cache-control: public, immutable'"
+gate "G4.5 hashed asset: exactly one immutable Cache-Control ($ASSET)" \
+  "[ -n '$ASSET' ] && [ \"\$(curl -sI $URL$ASSET | grep -ci '^cache-control: public, max-age=31536000, immutable')\" = 1 ]"
 gate "G4.6 internal /healthz → 200 ok:true (DB reachable)" \
   "vps 'curl -fsS http://127.0.0.1:$LIVE/healthz' | grep -q '\"ok\":true'"
 MIG=$(vps 'cd /opt/combined-discount/current && sudo env $(sudo grep -E "^DATABASE_URL=" /etc/combined-discount/env) runuser -u combined-discount -- env HOME=/opt/combined-discount npx prisma migrate status 2>&1 | grep -c "Database schema is up to date"')

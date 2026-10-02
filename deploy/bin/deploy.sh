@@ -63,8 +63,9 @@ idle_port() { local live; live=$(live_port); [[ $live == "${PORTS[0]}" ]] && ech
 previous_release() {
   local live
   live=$(readlink -f "$CURRENT" 2>/dev/null || true)
-  # Newest release that built cleanly and isn't the live one; a failed build's
-  # leftover directory must never become a rollback target.
+  # Newest release that has served production before and isn't the live one.
+  # A release that failed to build, migrate or come up never earns the marker,
+  # so it can never become a rollback target.
   find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r |
     while read -r r; do
       [[ $RELEASES/$r != "$live" && -f $RELEASES/$r/.deployable ]] && { echo "$RELEASES/$r"; break; }
@@ -85,6 +86,18 @@ slot_healthy() {
   return 1
 }
 
+# /healthz proves the process and the database; it can't see a route that
+# breaks on its own. Smoke the pages Shopify loads on the idle slot directly,
+# before it gets any traffic.
+readonly SMOKE_PATHS=(/ /auth/login)
+slot_smoke() {
+  local port=$1 path code
+  for path in "${SMOKE_PATHS[@]}"; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port$path")
+    [[ $code == 200 ]] || { echo "smoke: GET $path on :$port → $code" >&2; return 1; }
+  done
+}
+
 start_slot() {
   local port=$1 rel=$2
   ln -sfn "$rel" "$SLOTS/$port.next" && mv -T "$SLOTS/$port.next" "$SLOTS/$port"
@@ -100,18 +113,29 @@ stop_slot() {
   systemctl reset-failed "$APP@$1" 2>/dev/null || true
 }
 
+write_upstream() {
+  cat <<EOF
+# Managed by $APP-deploy — the live blue/green slot. Do not edit by hand.
+upstream combined_discount {
+    server 127.0.0.1:$1;
+    keepalive 16;
+}
+
+# Which slot served a request, echoed as X-Upstream to loopback clients only,
+# so the deploy can tell the new slot is really taking traffic.
+map \$remote_addr \$combined_discount_slot {
+    127.0.0.1 \$upstream_addr;
+    default   "";
+}
+EOF
+}
+
 # Point nginx at a slot. The old file is restored if `nginx -t` rejects the new
 # one, so a bad write can never leave nginx unloadable.
 route_to() {
   local port=$1 prev
   prev=$(cat "$UPSTREAM_CONF" 2>/dev/null || true)
-  cat > "$UPSTREAM_CONF.next" <<EOF
-# Managed by $APP-deploy — the live blue/green slot. Do not edit by hand.
-upstream combined_discount {
-    server 127.0.0.1:$port;
-    keepalive 16;
-}
-EOF
+  write_upstream "$port" > "$UPSTREAM_CONF.next"
   mv -f "$UPSTREAM_CONF.next" "$UPSTREAM_CONF"
   if ! nginx -t -q 2>/dev/null; then
     if [[ -n $prev ]]; then printf '%s\n' "$prev" > "$UPSTREAM_CONF"; else rm -f "$UPSTREAM_CONF"; fi
@@ -120,11 +144,24 @@ EOF
   systemctl reload nginx
 }
 
-# End to end through nginx and TLS, the way Shopify reaches the app.
+# End to end through nginx and TLS, the way Shopify reaches the app. Only a
+# response that X-Upstream proves came from the new slot counts: `nginx
+# reload` returns before the new workers take over, and a check answered by an
+# old worker (still routing to the old slot) would pass a broken release.
 edge_healthy() {
-  for _ in $(seq 1 10); do
-    [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-         --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/auth/login") == 200 ]] && return 0
+  local port=$1 path hdr seen=0
+  for _ in $(seq 1 20); do
+    local all_ok=1 from_new=1
+    for path in "${SMOKE_PATHS[@]}"; do
+      hdr=$(curl -s -D - -o /dev/null --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" \
+            "https://$DOMAIN$path" | tr -d '\r')
+      grep -qi "^x-upstream: 127.0.0.1:$port\$" <<<"$hdr" || from_new=0
+      grep -qE '^HTTP/[0-9.]+ 200' <<<"$hdr" || all_ok=0
+    done
+    if (( from_new )); then
+      (( all_ok )) && return 0
+      (( ++seen >= 3 )) && return 1   # the new slot itself is answering wrongly
+    fi
     sleep 1
   done
   return 1
@@ -137,7 +174,7 @@ go_live() {
   old=$(live_port); new=$(idle_port)
   log "starting $(basename "$rel") on idle slot :$new"
   start_slot "$new" "$rel"
-  if ! slot_healthy "$new"; then
+  if ! slot_healthy "$new" || ! slot_smoke "$new"; then
     journalctl -u "$APP@$new" -n 30 --no-pager -q >&2 || true
     stop_slot "$new"
     die "$(basename "$rel") never became healthy on :$new; live slot :${old:-none} untouched"
@@ -145,7 +182,7 @@ go_live() {
 
   log "switching nginx :${old:-none} → :$new"
   route_to "$new" || { stop_slot "$new"; die "nginx rejected the new upstream; live slot untouched"; }
-  if ! edge_healthy; then
+  if ! edge_healthy "$new"; then
     if [[ -n $old ]]; then
       log "edge check failed — switching nginx back to :$old"
       route_to "$old" || true
@@ -155,6 +192,7 @@ go_live() {
   fi
 
   ln -sfn "$rel" "$CURRENT.next" && mv -T "$CURRENT.next" "$CURRENT"
+  as_app touch "$rel/.deployable"   # proven in production: a valid rollback target
   systemctl enable --quiet "$APP@$new"
   if [[ -n $old && $old != "$new" ]]; then
     # nginx's old workers finish their in-flight requests to the old slot.
@@ -182,7 +220,7 @@ cmd_status() {
   echo "releases:"
   find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r |
     while read -r r; do
-      printf '  %s%s\n' "$r" "$([[ -f $RELEASES/$r/.deployable ]] || echo '  (failed, not deployable)')"
+      printf '  %s%s\n' "$r" "$([[ -f $RELEASES/$r/.deployable ]] || echo '  (never went live — not a rollback target)')"
     done
   for p in "${PORTS[@]}"; do echo "slot :$p  $(systemctl is-active "$APP@$p" || true)"; done
 }
@@ -221,7 +259,6 @@ cmd_deploy() {
   # then contract in a later release).
   log "applying migrations"
   ( cd "$rel" && with_env npx prisma migrate deploy ) || die "migration failed; live slot untouched"
-  as_app touch "$rel/.deployable"
 
   go_live "$rel"
 
