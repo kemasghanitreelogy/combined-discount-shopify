@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Atomic release deploy for combined-discount on the VPS. Runs as root on the server.
+# Zero-downtime blue/green deploy for combined-discount on the VPS. Runs as root.
 #
-#   deploy.sh [git-ref]     build <git-ref> (default: main) and switch to it
-#   deploy.sh rollback      switch back to the previous release
-#   deploy.sh status        show the live and available releases
+#   deploy.sh [git-ref]     build <git-ref> (default: main) and make it live
+#   deploy.sh rollback      make the previous release live again (no rebuild)
+#   deploy.sh status        show the live slot and the available releases
 #
-# Each release is built in its own directory and only goes live by an atomic
-# symlink swap, after migrations ran and before the health check. A release that
-# fails its health check is rolled back automatically, so a bad deploy costs a
-# few seconds of restart, never a broken site.
+# Two slots, 127.0.0.1:3200 and :3201, each a combined-discount@<port> unit
+# running the release its slots/<port> symlink points at. A deploy builds a new
+# release, starts it on the idle slot, and only once that slot answers /healthz
+# does nginx switch to it — via a graceful reload, so in-flight requests finish
+# on the old slot. A release that fails anywhere before the switch never takes
+# traffic; one that misbehaves right after it is switched back while the old
+# slot is still running.
 set -Eeuo pipefail
 
 readonly APP=combined-discount
@@ -16,17 +19,21 @@ readonly BASE=/opt/$APP
 readonly REPO_URL=https://github.com/kemasghanitreelogy/combined-discount-shopify.git
 readonly MIRROR=$BASE/repo.git
 readonly RELEASES=$BASE/releases
+readonly SLOTS=$BASE/slots
 readonly CURRENT=$BASE/current
 readonly ENV_FILE=/etc/$APP/env
-readonly HEALTH_URL=http://127.0.0.1:3200/healthz
+readonly UPSTREAM_CONF=/etc/nginx/conf.d/$APP-upstream.conf
+readonly DOMAIN=discount.treelogy-services.my.id
+readonly PORTS=(3200 3201)
 readonly KEEP_RELEASES=5
+readonly DRAIN_SECONDS=10
 
 log() { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "run as root (sudo $0 $*)"
 
-# One deploy at a time: two builds racing for the same symlink is how you get a
+# One deploy at a time: two builds racing for the same slot is how you get a
 # release nobody built.
 exec 9>/run/lock/$APP-deploy.lock
 flock -n 9 || die "another deploy is already running"
@@ -50,6 +57,9 @@ with_env() {
     exec "$@"' "$ENV_FILE" "$@"
 }
 
+live_port() { sed -nE 's/^[[:space:]]*server 127\.0\.0\.1:([0-9]+);.*/\1/p' "$UPSTREAM_CONF" 2>/dev/null | head -1; }
+idle_port() { local live; live=$(live_port); [[ $live == "${PORTS[0]}" ]] && echo "${PORTS[1]}" || echo "${PORTS[0]}"; }
+
 previous_release() {
   local live
   live=$(readlink -f "$CURRENT" 2>/dev/null || true)
@@ -61,26 +71,120 @@ previous_release() {
     done
 }
 
-switch_to() {
-  ln -sfn "$1" "$CURRENT.next"
-  mv -T "$CURRENT.next" "$CURRENT"
-  systemctl restart "$APP"
-}
-
-healthy() {
-  # Neon's free tier suspends idle computes, so the first query can take a few
-  # seconds to wake it. 60s covers that with room to spare.
+# Poll a slot's /healthz. Neon's free tier suspends idle computes, so the first
+# query can take a few seconds to wake it; 60s covers that. A slot that keeps
+# crashing is given up on at its second automatic restart instead.
+slot_healthy() {
+  local port=$1 unit=$APP@$1 restarts
+  restarts=$(systemctl show -p NRestarts --value "$unit")
   for _ in $(seq 1 30); do
-    curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 5 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0
+    (( $(systemctl show -p NRestarts --value "$unit") - restarts >= 2 )) && return 1
     sleep 2
   done
   return 1
 }
 
+start_slot() {
+  local port=$1 rel=$2
+  ln -sfn "$rel" "$SLOTS/$port.next" && mv -T "$SLOTS/$port.next" "$SLOTS/$port"
+  # A slot that crash-looped earlier is left "failed" by StartLimitBurst and
+  # would refuse a plain start.
+  systemctl reset-failed "$APP@$port" 2>/dev/null || true
+  systemctl restart "$APP@$port" || true   # whether it came up is slot_healthy's call
+}
+
+stop_slot() {
+  systemctl stop "$APP@$1" 2>/dev/null || true
+  systemctl disable --quiet "$APP@$1" 2>/dev/null || true
+  systemctl reset-failed "$APP@$1" 2>/dev/null || true
+}
+
+# Point nginx at a slot. The old file is restored if `nginx -t` rejects the new
+# one, so a bad write can never leave nginx unloadable.
+route_to() {
+  local port=$1 prev
+  prev=$(cat "$UPSTREAM_CONF" 2>/dev/null || true)
+  cat > "$UPSTREAM_CONF.next" <<EOF
+# Managed by $APP-deploy — the live blue/green slot. Do not edit by hand.
+upstream combined_discount {
+    server 127.0.0.1:$port;
+    keepalive 16;
+}
+EOF
+  mv -f "$UPSTREAM_CONF.next" "$UPSTREAM_CONF"
+  if ! nginx -t -q 2>/dev/null; then
+    if [[ -n $prev ]]; then printf '%s\n' "$prev" > "$UPSTREAM_CONF"; else rm -f "$UPSTREAM_CONF"; fi
+    return 1
+  fi
+  systemctl reload nginx
+}
+
+# End to end through nginx and TLS, the way Shopify reaches the app.
+edge_healthy() {
+  for _ in $(seq 1 10); do
+    [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+         --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/auth/login") == 200 ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# The heart of deploy and rollback: bring <rel> up on the idle slot, switch
+# nginx to it, then retire the old slot.
+go_live() {
+  local rel=$1 old new
+  old=$(live_port); new=$(idle_port)
+  log "starting $(basename "$rel") on idle slot :$new"
+  start_slot "$new" "$rel"
+  if ! slot_healthy "$new"; then
+    journalctl -u "$APP@$new" -n 30 --no-pager -q >&2 || true
+    stop_slot "$new"
+    die "$(basename "$rel") never became healthy on :$new; live slot :${old:-none} untouched"
+  fi
+
+  log "switching nginx :${old:-none} → :$new"
+  route_to "$new" || { stop_slot "$new"; die "nginx rejected the new upstream; live slot untouched"; }
+  if ! edge_healthy; then
+    if [[ -n $old ]]; then
+      log "edge check failed — switching nginx back to :$old"
+      route_to "$old" || true
+    fi
+    stop_slot "$new"
+    die "$(basename "$rel") failed behind nginx; traffic is back on :${old:-none}"
+  fi
+
+  ln -sfn "$rel" "$CURRENT.next" && mv -T "$CURRENT.next" "$CURRENT"
+  systemctl enable --quiet "$APP@$new"
+  if [[ -n $old && $old != "$new" ]]; then
+    # nginx's old workers finish their in-flight requests to the old slot.
+    sleep "$DRAIN_SECONDS"
+    stop_slot "$old"
+  fi
+  log "live: $(basename "$rel") on :$new"
+}
+
+# Each step is checked explicitly: `set -e` is suspended inside a subshell
+# whose status is tested with `||`, so a failing build would otherwise fall
+# through to the next command and report success.
+build_release() {
+  cd "$1" || return 1
+  export NODE_OPTIONS=--max-old-space-size=1536
+  as_app npm ci --no-audit --no-fund --loglevel=error || return 1
+  as_app npx prisma generate || return 1
+  as_app npm run build || return 1
+  [[ -f build/server/index.js ]] || { echo "build produced no build/server/index.js" >&2; return 1; }
+  as_app npm prune --omit=dev --no-audit --no-fund --loglevel=error || return 1
+}
+
 cmd_status() {
-  echo "live:     $(readlink -f "$CURRENT" 2>/dev/null || echo none)"
-  echo "releases:"; ls -1r "$RELEASES" 2>/dev/null | sed 's/^/  /'
-  systemctl --no-pager --lines=0 status "$APP" || true
+  echo "live:     $(readlink -f "$CURRENT" 2>/dev/null || echo none) on :$(live_port)"
+  echo "releases:"
+  find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r |
+    while read -r r; do
+      printf '  %s%s\n' "$r" "$([[ -f $RELEASES/$r/.deployable ]] || echo '  (failed, not deployable)')"
+    done
+  for p in "${PORTS[@]}"; do echo "slot :$p  $(systemctl is-active "$APP@$p" || true)"; done
 }
 
 cmd_rollback() {
@@ -88,13 +192,11 @@ cmd_rollback() {
   target=$(previous_release)
   [[ -n $target ]] || die "no previous release to roll back to"
   log "rolling back to $(basename "$target")"
-  switch_to "$target"
-  healthy || die "rollback target is unhealthy too; check: journalctl -u $APP -n 100"
-  log "rolled back; live: $(basename "$target")"
+  go_live "$target"
 }
 
 cmd_deploy() {
-  local ref=$1 sha rel prev
+  local ref=$1 sha rel
   [[ -r $ENV_FILE ]] || die "$ENV_FILE missing"
 
   if [[ ! -d $MIRROR ]]; then
@@ -112,44 +214,23 @@ cmd_deploy() {
   echo "$sha" | as_app tee "$rel/REVISION" >/dev/null
 
   # A failed build leaves its directory behind for inspection but never goes live.
-  (
-    cd "$rel"
-    export NODE_OPTIONS=--max-old-space-size=1536
-    as_app npm ci --no-audit --no-fund --loglevel=error
-    as_app npx prisma generate
-    as_app npm run build
-    as_app npm prune --omit=dev --no-audit --no-fund --loglevel=error
-  ) || die "build failed; live release untouched ($rel left for inspection)"
+  ( build_release "$rel" ) || die "build failed; live slot untouched ($rel left for inspection)"
 
   # Migrations run before the switch, against the database the old release is
   # still serving from — so they must stay backward compatible (expand, deploy,
   # then contract in a later release).
   log "applying migrations"
-  ( cd "$rel" && with_env npx prisma migrate deploy ) || die "migration failed; live release untouched"
+  ( cd "$rel" && with_env npx prisma migrate deploy ) || die "migration failed; live slot untouched"
   as_app touch "$rel/.deployable"
 
-  prev=$(readlink -f "$CURRENT" 2>/dev/null || true)
-  log "switching live release"
-  switch_to "$rel"
+  go_live "$rel"
 
-  if ! healthy; then
-    journalctl -u "$APP" -n 40 --no-pager >&2 || true
-    if [[ -n $prev && -d $prev ]]; then
-      log "health check failed — rolling back to $(basename "$prev")"
-      switch_to "$prev"
-      healthy || die "rollback target is unhealthy too; check: journalctl -u $APP -n 100"
-      die "deploy of ${sha:0:7} failed health check; rolled back to $(basename "$prev")"
-    fi
-    die "deploy of ${sha:0:7} failed health check and there is no previous release"
-  fi
-
-  # Keep the newest few releases for instant rollback; never the live one.
-  local live; live=$(readlink -f "$CURRENT")
+  # Keep the newest few releases for instant rollback; never one a slot uses.
+  local in_use
+  in_use=$(for p in "${PORTS[@]}"; do readlink -f "$SLOTS/$p" 2>/dev/null || true; done; readlink -f "$CURRENT")
   find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r |
     tail -n +$((KEEP_RELEASES + 1)) |
-    while read -r r; do [[ $RELEASES/$r != "$live" ]] && rm -rf -- "${RELEASES:?}/$r"; done
-
-  log "live: $(basename "$rel") (${sha:0:7})"
+    while read -r r; do grep -qxF "$RELEASES/$r" <<<"$in_use" || rm -rf -- "${RELEASES:?}/$r"; done
 }
 
 case ${1:-main} in

@@ -1,11 +1,14 @@
-# /etc/systemd/system/combined-discount.service
+# /etc/systemd/system/combined-discount@.service
 #
-# Combined Discount Shopify app — 127.0.0.1:3200, behind nginx at
-# discount.treelogy-services.my.id. Code lives in /opt/combined-discount/current,
-# a symlink the deploy script swaps atomically; the service is stateless (the
-# session store is Neon Postgres), so it gets no writable path at all.
+# Combined Discount Shopify app, one instance per blue/green slot: %i is the
+# port (3200 or 3201). nginx sends traffic to whichever slot
+# /etc/nginx/conf.d/combined-discount-upstream.conf names; the deploy script
+# starts the idle slot on the new release, health-checks it, flips nginx with a
+# graceful reload, then stops the old slot — so no request ever waits on a
+# restart. Each slot runs the release its /opt/combined-discount/slots/%i
+# symlink points at. Stateless (sessions live in Neon), so no writable path.
 [Unit]
-Description=Combined Discount Shopify app (127.0.0.1:3200, behind nginx)
+Description=Combined Discount Shopify app, slot %i (127.0.0.1:%i, behind nginx)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -15,18 +18,18 @@ StartLimitBurst=10
 Type=simple
 User=combined-discount
 Group=combined-discount
-WorkingDirectory=/opt/combined-discount/current
+WorkingDirectory=/opt/combined-discount/slots/%i
 EnvironmentFile=/etc/combined-discount/env
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
-Environment=PORT=3200
+Environment=PORT=%i
 ExecStart=/usr/bin/node ./node_modules/.bin/react-router-serve ./build/server/index.js
 Restart=always
 RestartSec=3
 TimeoutStopSec=20
 
 # Resource ceiling: the box is shared with the Treelogy services, so a leak here
-# must not take them down with it.
+# must not take them down with it. Both slots run together only during a switch.
 MemoryHigh=640M
 MemoryMax=768M
 TasksMax=256

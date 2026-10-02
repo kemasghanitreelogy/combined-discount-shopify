@@ -1,206 +1,171 @@
 #!/usr/bin/env bash
 #
-# End-to-end deploy validation for Shopify app on Fly.io + Neon.
-# See DEPLOY_RUNBOOK.md for full context. Every gate ID (G1.1, G2.3, etc.)
-# maps to a section in that document.
+# End-to-end production validation for the VPS deployment (see deploy/README.md).
+# Runs every gate and reports all failures instead of stopping at the first.
+# Nothing here mutates shop data: signed webhooks are sent for a shop that has
+# no session, and the authorised admin-API probe is a malformed body that is
+# rejected after the secret check but before any Shopify call.
 #
-# Usage:
-#   export FLY_APP="combined-discount-shopify"
-#   export CLIENT_ID="<32-char-client-id>"
-#   export SHOP_DOMAIN="<shop>.myshopify.com"
-#   ./scripts/validate-deploy.sh
+#   ./scripts/validate-deploy.sh             # all gates
+#   SKIP_RESTART=1 ./scripts/validate-deploy.sh   # skip the kill -9 resilience gate
 #
-# Exit codes:
-#   0 — all gates passed
-#   1 — a gate failed (stops at first failure)
-#   2 — environment setup error (missing required env var)
+# Needs: the `treelogy-vps` SSH alias with passwordless sudo, curl, openssl, dig.
+# Exit code: number of failed gates (0 = all green).
+set -uo pipefail
+cd "$(dirname "$0")/.."
 
-set -u
+readonly DOMAIN=discount.treelogy-services.my.id
+readonly URL=https://$DOMAIN
+readonly VPS_IP=203.145.35.26
+readonly CLIENT_ID=fb959e692364c4077d75bd1908f8c38f
+readonly FAKE_SHOP=qa-validate-deploy-nonexistent.myshopify.com
 
-: "${FLY_APP:?export FLY_APP first (e.g. combined-discount-shopify)}"
-: "${CLIENT_ID:?export CLIENT_ID first (32-char Shopify client ID)}"
-: "${SHOP_DOMAIN:?export SHOP_DOMAIN first (e.g. myshop.myshopify.com)}"
+PASS=0 FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗ %s\033[0m %s\n' "$1" "${2:-}"; }
+gate() { if eval "$2"; then ok "$1"; else bad "$1" "${3:-}"; fi; }
+section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+vps() { ssh -o BatchMode=yes treelogy-vps "$@" 2>/dev/null | grep -v -E 'AUTHORIZED|Terminated|Activity|idcloudhost|___|^ *\||^\s*$'; }
+code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
+header() { curl -sI --max-time 20 "$URL${2:-/}" | tr -d '\r' | grep -i "^$1:" | head -1 | cut -d' ' -f2-; }
 
-FLY_URL="https://${FLY_APP}.fly.dev"
+# Secrets are read from the server and kept in memory only — never printed.
+env_get() { vps "sudo grep -E '^$1=' /etc/combined-discount/env | cut -d= -f2-"; }
+API_SECRET=$(env_get SHOPIFY_API_SECRET)
+ADMIN_SECRET=$(env_get ADMIN_API_SECRET)
 
-fail() { echo "❌ $1" >&2; exit 1; }
-pass() { echo "✅ $1"; }
-info() { echo "▸  $1"; }
+# ───────────────────────────── G1 repo ─────────────────────────────
+section "G1 · Repo configuration"
+gate "G1.1 application_url is $URL" \
+  "grep -q '^application_url = \"$URL\"' shopify.app.toml"
+gate "G1.2 every auth redirect URL is on $DOMAIN" \
+  "[ \$(grep -cE '\"https://[^\"]+/(auth|api/auth)' shopify.app.toml) -eq \$(grep -c '\"$URL/' shopify.app.toml) ]"
+gate "G1.3 Prisma on Postgres" "grep -q 'provider = \"postgresql\"' prisma/schema.prisma"
+gate "G1.4 no fly.dev URL left in app config" "! grep -q 'fly.dev' shopify.app.toml"
 
-info "Validating deploy of $FLY_APP for shop $SHOP_DOMAIN"
-echo ""
+# ───────────────────────────── G2 edge ─────────────────────────────
+section "G2 · DNS, TLS, edge"
+for r in 8.8.8.8 1.1.1.1 dewi.ns.dnscloud.id; do
+  gate "G2.1 $DOMAIN → $VPS_IP via $r" "[ \"\$(dig +short $DOMAIN @$r | tail -1)\" = $VPS_IP ]"
+done
+CERT=$(echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>/dev/null | openssl x509 -noout -subject -issuer -enddate -ext subjectAltName 2>/dev/null)
+gate "G2.2 certificate covers $DOMAIN" "grep -q 'DNS:$DOMAIN' <<<\"\$CERT\""
+gate "G2.3 issued by Let's Encrypt" "grep -qi \"issuer=.*Let's Encrypt\" <<<\"\$CERT\""
+gate "G2.4 certificate valid ≥ 14 more days" \
+  "echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>/dev/null | openssl x509 -noout -checkend 1209600 >/dev/null"
+gate "G2.5 TLS 1.3 accepted" "echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN -tls1_3 2>/dev/null | grep -q 'TLSv1.3'"
+gate "G2.6 TLS 1.1 refused" "! echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN -tls1_1 2>/dev/null | grep -q 'Cipher is [A-Z]'"
+gate "G2.7 HTTP → HTTPS 301" "[ \"\$(code http://$DOMAIN/x)\" = 301 ] && curl -sI http://$DOMAIN/x | grep -qi '^location: https://$DOMAIN/x'"
+gate "G2.8 HSTS header" "[ -n \"\$(header strict-transport-security)\" ]"
+gate "G2.9 X-Content-Type-Options nosniff" "[ \"\$(header x-content-type-options)\" = nosniff ]"
+gate "G2.10 no X-Frame-Options (embedded app must be frameable)" "[ -z \"\$(header x-frame-options)\" ]"
+gate "G2.11 HTTP/2 negotiated" "[ \"\$(curl -s -o /dev/null -w '%{http_version}' --http2 $URL/)\" = 2 ]"
+for p in 3200 3201; do
+  gate "G2.12 slot port $p unreachable from the internet" "! nc -z -G 5 $VPS_IP $p 2>/dev/null && ! nc -z -w 5 $VPS_IP $p 2>/dev/null"
+done
+gate "G2.13 /healthz hidden from the internet (404)" "[ \"\$(code $URL/healthz)\" = 404 ]"
 
-# Auto-warm the machine — auto-stopped VMs reject flyctl ssh.
-# Trigger boot via HTTP so subsequent ssh commands succeed.
-DNS_IP_WARM=$(dig @8.8.8.8 +short "${FLY_APP}.fly.dev" 2>/dev/null | head -1)
-if [ -n "$DNS_IP_WARM" ]; then
-  curl -s -o /dev/null --max-time 30 \
-    --resolve "${FLY_APP}.fly.dev:443:$DNS_IP_WARM" \
-    "${FLY_URL}/" || true
-  # Give the VM a beat to bind 0.0.0.0:3000 before ssh-ing in
-  sleep 3
-fi
+# ───────────────────────────── G3 server ─────────────────────────────
+section "G3 · Server"
+# Blue/green: the live slot is whichever port nginx's upstream names.
+LIVE=$(vps "sed -nE 's/^ *server 127\.0\.0\.1:([0-9]+);.*/\1/p' /etc/nginx/conf.d/combined-discount-upstream.conf")
+IDLE=$([ "$LIVE" = 3200 ] && echo 3201 || echo 3200)
+S=$(vps 'L='"$LIVE"' I='"$IDLE"'; U=combined-discount@$L
+  echo "active=$(systemctl is-active $U)"
+  echo "idle=$(systemctl is-active combined-discount@$I)"
+  echo "idleenabled=$(systemctl is-enabled combined-discount@$I 2>/dev/null)"
+  echo "slotrel=$(readlink -f /opt/combined-discount/slots/$L)"
+  echo "currentrel=$(readlink -f /opt/combined-discount/current)"
+  echo "enabled=$(systemctl is-enabled $U)"
+  echo "user=$(systemctl show $U -p User --value)"
+  echo "memmax=$(systemctl show $U -p MemoryMax --value)"
+  echo "listen=$(sudo ss -tlnH "( sport = :3200 or sport = :3201 )" | awk "{print \$4}" | tr "\n" " ")"
+  echo "envperm=$(sudo stat -c "%U:%G:%a" /etc/combined-discount/env)"
+  echo "revision=$(cat /opt/combined-discount/current/REVISION)"
+  echo "deployable=$(test -f /opt/combined-discount/current/.deployable && echo yes)"
+  echo "exposure=$(sudo systemd-analyze security $U --no-pager 2>/dev/null | tail -1 | grep -oE "[0-9]+\.[0-9]+")"
+  echo "swap=$(swapon --show=NAME --noheadings | head -1)"
+  echo "neighbours=$(systemctl is-active treelogy treelogy-qa-web nginx redis-server certbot.timer | tr "\n" " ")"
+  echo "hook=$(test -x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh && echo yes)"
+  echo "nginx=$(sudo nginx -t 2>&1 | grep -c successful)"
+  echo "errors=$(sudo journalctl -u "combined-discount@*" --since "-15 min" -p err --no-pager -q | grep -c .)"')
+v() { sed -n "s/^$1=//p" <<<"$S" | head -1; }
+gate "G3.0 nginx routes to a slot (live :$LIVE)"  "[[ '$LIVE' =~ ^320[01]$ ]]"
+gate "G3.1 live slot active"                   "[ \"\$(v active)\" = active ]"
+gate "G3.1b idle slot stopped and not enabled"  "[ \"\$(v idle)\" != active ] && [ \"\$(v idleenabled)\" != enabled ]"
+gate "G3.1c live slot runs the current release" "[ -n \"\$(v slotrel)\" ] && [ \"\$(v slotrel)\" = \"\$(v currentrel)\" ]"
+gate "G3.2 live slot enabled at boot"            "[ \"\$(v enabled)\" = enabled ]"
+gate "G3.3 runs as unprivileged combined-discount" "[ \"\$(v user)\" = combined-discount ]"
+gate "G3.4 memory ceiling set (768M)"          "[ \"\$(v memmax)\" = 805306368 ]"
+gate "G3.5 only the live slot listens, on loopback" "[ \"\$(v listen)\" = '127.0.0.1:$LIVE ' ]"
+gate "G3.6 env file root:combined-discount 640" "[ \"\$(v envperm)\" = root:combined-discount:640 ]"
+ORIGIN_MAIN=$(git ls-remote origin refs/heads/main | cut -f1)
+gate "G3.7 live release = origin/main (${ORIGIN_MAIN:0:7})" "[ \"\$(v revision)\" = '$ORIGIN_MAIN' ]"
+gate "G3.8 live release passed build + migrations" "[ \"\$(v deployable)\" = yes ]"
+EXPOSURE=$(v exposure)
+gate "G3.9 systemd exposure score ≤ 3.0 (${EXPOSURE:-n/a})" "[ -n '$EXPOSURE' ] && awk -v e='$EXPOSURE' 'BEGIN{exit !(e <= 3.0)}'"
+gate "G3.10 swap enabled"                      "[ -n \"\$(v swap)\" ]"
+gate "G3.11 neighbours + certbot timer active" "[ \"\$(v neighbours)\" = 'active active active active active ' ]"
+gate "G3.12 cert renewal reloads nginx"        "[ \"\$(v hook)\" = yes ]"
+gate "G3.13 nginx config valid"                "[ \"\$(v nginx)\" = 1 ]"
+gate "G3.14 no service errors in last 15 min"  "[ \"\$(v errors)\" = 0 ]" "(journalctl -u combined-discount@* -p err)"
+for k in SHOPIFY_APP_URL SHOPIFY_API_KEY SHOPIFY_API_SECRET SCOPES DATABASE_URL ADMIN_API_SECRET; do
+  gate "G3.15 env $k set" "[ -n \"\$(env_get $k)\" ]"
+done
+gate "G3.16 SHOPIFY_APP_URL = $URL"    "[ \"\$(env_get SHOPIFY_APP_URL)\" = $URL ]"
+gate "G3.17 SHOPIFY_API_KEY = client_id" "[ \"\$(env_get SHOPIFY_API_KEY)\" = $CLIENT_ID ]"
+gate "G3.18 SCOPES match shopify.app.toml" \
+  "[ \"\$(env_get SCOPES)\" = \"\$(sed -nE 's/^scopes = \"(.*)\"/\1/p' shopify.app.toml)\" ]"
+gate "G3.19 DATABASE_URL requires TLS"  "env_get DATABASE_URL | grep -q 'sslmode=require'"
 
-# Helper: run node eval via flyctl ssh, strip Connecting… line + whitespace
-fly_node() {
-  flyctl ssh console -a "$FLY_APP" -C "node -e \"$1\"" 2>/dev/null \
-    | grep -v "^Connecting" | tr -d '\r\n ' | tail -c 2048
+# ───────────────────────────── G4 app ─────────────────────────────
+section "G4 · App over HTTPS"
+gate "G4.1 / → 200"             "[ \"\$(code $URL/)\" = 200 ]"
+gate "G4.2 /auth/login → 200"   "[ \"\$(code $URL/auth/login)\" = 200 ]"
+APP_CODE=$(code "$URL/app")
+gate "G4.3 /app without session → embedded-auth bounce ($APP_CODE)" "[[ $APP_CODE =~ ^(302|410)$ ]]"
+gate "G4.4 unknown path → 404, not 5xx" "[ \"\$(code $URL/qa-no-such-page)\" = 404 ]"
+ASSET=$(curl -s --max-time 20 "$URL/auth/login" | grep -oE '/assets/[A-Za-z0-9._-]+\.js' | head -1)
+gate "G4.5 hashed asset served immutable ($ASSET)" \
+  "[ -n '$ASSET' ] && curl -sI $URL$ASSET | grep -qi '^cache-control: public, immutable'"
+gate "G4.6 internal /healthz → 200 ok:true (DB reachable)" \
+  "vps 'curl -fsS http://127.0.0.1:$LIVE/healthz' | grep -q '\"ok\":true'"
+MIG=$(vps 'cd /opt/combined-discount/current && sudo env $(sudo grep -E "^DATABASE_URL=" /etc/combined-discount/env) runuser -u combined-discount -- env HOME=/opt/combined-discount npx prisma migrate status 2>&1 | grep -c "Database schema is up to date"')
+gate "G4.7 Neon schema up to date with release" "[ '$MIG' = 1 ]"
+
+# ───────────────────────────── G5 webhooks ─────────────────────────────
+section "G5 · Webhooks (HMAC)"
+send_webhook() { # topic path secret → http code
+  local body='{"id":1,"current":["read_orders"],"previous":[]}' sig
+  sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$3" -binary | base64)
+  curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$URL$2" \
+    -H 'Content-Type: application/json' -H "X-Shopify-Topic: $1" \
+    -H "X-Shopify-Shop-Domain: $FAKE_SHOP" -H "X-Shopify-Hmac-Sha256: $sig" \
+    -H 'X-Shopify-API-Version: 2026-07' -H "X-Shopify-Webhook-Id: qa-$RANDOM$RANDOM" \
+    -H "X-Shopify-Event-Id: qa-$RANDOM$RANDOM" -H "X-Shopify-Triggered-At: $(date -u +%FT%TZ)" \
+    --data "$body"
 }
+for t in orders/create:/webhooks/orders/create app/scopes_update:/webhooks/app/scopes_update app/uninstalled:/webhooks/app/uninstalled; do
+  topic=${t%%:*} path=${t#*:}
+  gate "G5.1 $topic forged HMAC → 401" "[ \"\$(send_webhook $topic $path wrong-secret)\" = 401 ]"
+  gate "G5.2 $topic valid HMAC → 200"  "[ \"\$(send_webhook $topic $path \"\$API_SECRET\")\" = 200 ]"
+done
 
-# ---------------------- Gate 1 — Local repo state ----------------------
+# ───────────────────────────── G6 admin API ─────────────────────────────
+section "G6 · Admin API (/api/admin/customers)"
+admin() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@" "$URL/api/admin/customers"; }
+gate "G6.1 GET → 405"                    "[ \"\$(admin)\" = 405 ]"
+gate "G6.2 POST without secret → 401"    "[ \"\$(admin -X POST -d '{}')\" = 401 ]"
+gate "G6.3 POST wrong secret → 401"      "[ \"\$(admin -X POST -H 'X-Admin-Secret: nope' -d '{}')\" = 401 ]"
+gate "G6.4 POST right secret, bad JSON → 400 (secret accepted)" \
+  "[ \"\$(admin -X POST -H \"X-Admin-Secret: \$ADMIN_SECRET\" -H 'Content-Type: application/json' -d 'not-json')\" = 400 ]"
 
-info "Gate 1 — Local repo state"
-
-grep -q 'provider = "postgresql"' prisma/schema.prisma 2>/dev/null \
-  || fail "G1.1 prisma/schema.prisma not provider=postgresql"
-grep -q 'provider = "postgresql"' prisma/migrations/migration_lock.toml 2>/dev/null \
-  || fail "G1.1 prisma/migrations/migration_lock.toml not postgresql"
-pass "G1.1 Prisma configured for Postgres"
-
-grep -q "openssl" Dockerfile 2>/dev/null && grep -q "prisma generate" Dockerfile 2>/dev/null \
-  || fail "G1.2 Dockerfile missing openssl or prisma generate"
-pass "G1.2 Dockerfile has openssl + prisma generate"
-
-grep -qxE "\.env" .dockerignore 2>/dev/null && grep -qxE "\.env\.\\*" .dockerignore 2>/dev/null \
-  || fail "G1.3 .env or .env.* not in .dockerignore (secrets would leak)"
-pass "G1.3 .env* blocked from image"
-
-grep -q 'release_command' fly.toml 2>/dev/null && grep -q 'auto_stop_machines' fly.toml 2>/dev/null \
-  || fail "G1.4 fly.toml missing release_command or auto_stop_machines"
-pass "G1.4 fly.toml release + auto-stop configured"
-
-node -e '
-  const p = require("./package.json").scripts || {};
-  if (!p["docker-start"] || !p["setup"] || !p["start"]) process.exit(1);
-' 2>/dev/null || fail "G1.5 package.json missing docker-start/setup/start scripts"
-pass "G1.5 package.json scripts present"
-
-echo ""
-
-# ---------------------- Gate 2 — Fly app + secrets ----------------------
-
-info "Gate 2 — Fly app + secrets"
-
-flyctl status -a "$FLY_APP" &>/dev/null \
-  || fail "G2.1 Fly app $FLY_APP does not exist (run: flyctl launch --no-deploy --copy-config --name $FLY_APP --region sin)"
-pass "G2.1 Fly app exists"
-
-SECRET_COUNT=$(flyctl secrets list -a "$FLY_APP" 2>/dev/null | awk 'NR>1{print $1}' | \
-  grep -cE "^(SHOPIFY_API_KEY|SHOPIFY_API_SECRET|DATABASE_URL|SHOPIFY_APP_URL)$" || true)
-[ "$SECRET_COUNT" = "4" ] \
-  || fail "G2.2 only $SECRET_COUNT/4 required secrets set (need SHOPIFY_API_KEY, SHOPIFY_API_SECRET, DATABASE_URL, SHOPIFY_APP_URL)"
-pass "G2.2 All 4 required secrets set"
-
-API_KEY_LEN=$(fly_node 'process.stdout.write(String((process.env.SHOPIFY_API_KEY||\"\").length))')
-[ "$API_KEY_LEN" = "32" ] \
-  || fail "G2.3 SHOPIFY_API_KEY length=[$API_KEY_LEN] (expected 32). Whitespace bug — re-set without quotes: flyctl secrets set SHOPIFY_API_KEY=$CLIENT_ID -a $FLY_APP"
-pass "G2.3 SHOPIFY_API_KEY length = 32"
-
-API_KEY_MATCH=$(fly_node "process.stdout.write(process.env.SHOPIFY_API_KEY === '$CLIENT_ID' ? 'YES' : 'NO')")
-[ "$API_KEY_MATCH" = "YES" ] \
-  || fail "G2.4 SHOPIFY_API_KEY on Fly does not equal CLIENT_ID ($CLIENT_ID)"
-pass "G2.4 API key matches Client ID"
-
-SSL_OK=$(fly_node 'process.stdout.write(/sslmode=require/.test(process.env.DATABASE_URL||\"\") ? \"YES\" : \"NO\")')
-[ "$SSL_OK" = "YES" ] \
-  || fail "G2.5 DATABASE_URL missing ?sslmode=require (Neon requires TLS)"
-pass "G2.5 DATABASE_URL has sslmode=require"
-
-APP_URL_OK=$(fly_node "process.stdout.write(process.env.SHOPIFY_APP_URL === '$FLY_URL' ? 'YES' : 'NO')")
-[ "$APP_URL_OK" = "YES" ] \
-  || fail "G2.6 SHOPIFY_APP_URL on Fly != $FLY_URL"
-pass "G2.6 SHOPIFY_APP_URL matches Fly host"
-
-echo ""
-
-# ---------------------- Gate 3 — Deployed + serving ----------------------
-
-info "Gate 3 — Deployed + serving HTTP"
-
-DNS_IP=$(dig @8.8.8.8 +short "${FLY_APP}.fly.dev" 2>/dev/null | head -1)
-[ -n "$DNS_IP" ] || fail "G3.2 ${FLY_APP}.fly.dev not in public DNS yet (wait 30s and retry)"
-
-# HTTP check with retry — auto-stopped Fly VMs take up to 10s to cold-start.
-http_with_retry() {
-  local path="$1" attempts=0 code=""
-  while [ "$attempts" -lt 5 ]; do
-    code=$(curl -s -o /dev/null --max-time 30 \
-      --resolve "${FLY_APP}.fly.dev:443:$DNS_IP" \
-      -w "%{http_code}" "${FLY_URL}${path}")
-    # Anything other than curl's "could not connect" (000) is a real response.
-    if [ "$code" != "000" ]; then echo "$code"; return 0; fi
-    attempts=$((attempts + 1))
-    sleep 5
-  done
-  echo "$code"
-  return 1
-}
-
-HTTP_CODE=$(http_with_retry "/")
-[[ "$HTTP_CODE" =~ ^2 ]] \
-  || fail "G3.2 root URL returned HTTP $HTTP_CODE (expected 2xx; tried 5× with 5s backoff)"
-pass "G3.2 Root URL HTTP $HTTP_CODE"
-
-APP_CODE=$(http_with_retry "/app")
-[ "$APP_CODE" = "410" ] || [ "$APP_CODE" = "302" ] \
-  || fail "G3.3 /app returned $APP_CODE (expected 410 or 302 — embedded-auth signal)"
-pass "G3.3 /app embedded-auth response ($APP_CODE)"
-
-flyctl ssh console -a "$FLY_APP" -C "npx prisma migrate status" 2>/dev/null \
-  | grep -q "up to date" \
-  || fail "G3.4 Prisma migrations not up to date on Neon (check flyctl logs for release_command errors)"
-pass "G3.4 Migrations applied to Neon"
-
-flyctl logs -a "$FLY_APP" --no-tail 2>/dev/null | tail -300 \
-  | grep -q "shopify-api/INFO" \
-  || fail "G3.5 Shopify library never initialized in recent logs (Node startup error?)"
-pass "G3.5 Shopify library initialized"
-
-echo ""
-
-# ---------------------- Gate 4 — Shopify app config ----------------------
-
-info "Gate 4 — Shopify app config"
-
-grep -q "application_url = \"$FLY_URL\"" shopify.app.toml \
-  || fail "G4.1 shopify.app.toml application_url != $FLY_URL"
-pass "G4.1 application_url matches Fly"
-
-grep -q "automatically_update_urls_on_dev = false" shopify.app.toml \
-  || fail "G4.2 automatically_update_urls_on_dev must be false (else shopify app dev will overwrite prod URL)"
-pass "G4.2 dev URL overwrite disabled"
-
-grep -q "$FLY_URL/auth/callback" shopify.app.toml \
-  || fail "G4.3 [auth] redirect_urls must include $FLY_URL/auth/callback"
-pass "G4.3 redirect_urls point to Fly"
-
-echo ""
-
-# ---------------------- Gate 5 — Post-install state ----------------------
-
-info "Gate 5 — Post-install state (run after OAuth install in Dev Dashboard)"
-
-SESS_COUNT=$(fly_node 'const{PrismaClient}=require(\"@prisma/client\"); new PrismaClient().session.count().then(c=>{process.stdout.write(String(c)); process.exit(0)})')
-if [ -z "$SESS_COUNT" ] || ! [[ "$SESS_COUNT" =~ ^[0-9]+$ ]] || [ "$SESS_COUNT" -lt 1 ]; then
-  fail "G5.1 Neon has [$SESS_COUNT] sessions — OAuth never completed. Open admin → Apps → your app → watch flyctl logs for 'Session token had invalid API key'"
+# ───────────────────────────── G7 resilience ─────────────────────────────
+if [ -z "${SKIP_RESTART:-}" ]; then
+  section "G7 · Resilience"
+  R=$(vps 'sudo systemctl kill -s KILL combined-discount@'"$LIVE"'; for i in $(seq 1 30); do sleep 1; curl -fsS http://127.0.0.1:'"$LIVE"'/healthz >/dev/null 2>&1 && { echo $i; break; }; done')
+  gate "G7.1 recovers from kill -9 (healthy after ${R:-?}s)" "[ -n '$R' ] && [ '$R' -le 20 ]"
 fi
-pass "G5.1 Neon sessions: $SESS_COUNT"
 
-SESS_HAS_TOKEN=$(fly_node "const{PrismaClient}=require('@prisma/client'); new PrismaClient().session.findFirst({where:{shop:'$SHOP_DOMAIN'}}).then(s=>{process.stdout.write(s && s.accessToken ? 'YES' : 'NO'); process.exit(0)})")
-[ "$SESS_HAS_TOKEN" = "YES" ] \
-  || fail "G5.2 no session with accessToken for shop=$SHOP_DOMAIN (re-install from Dev Dashboard)"
-pass "G5.2 Session for $SHOP_DOMAIN has access token"
-
-flyctl logs -a "$FLY_APP" --no-tail 2>/dev/null | tail -60 \
-  | grep -E "GET /app.*200" >/dev/null \
-  || fail "G5.3 no 200 response on /app in recent logs — iframe stuck in redirect loop"
-pass "G5.3 /app returned 200 recently"
-
-if flyctl logs -a "$FLY_APP" --no-tail 2>/dev/null | tail -500 \
-    | grep -q "Session token had invalid API key"; then
-  fail "G5.4 'Session token had invalid API key' in logs — whitespace-in-API-key bug active (re-do G2.3)"
-fi
-pass "G5.4 No invalid-API-key errors in recent logs"
-
-echo ""
-echo "🎉 All 19 gates PASS — $FLY_APP is live, authenticated, and correctly wired."
+printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
+exit "$FAIL"
