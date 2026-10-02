@@ -262,12 +262,25 @@ cmd_deploy() {
 
   go_live "$rel"
 
-  # Keep the newest few releases for instant rollback; never one a slot uses.
-  local in_use
+  prune_releases
+}
+
+# Keep the newest KEEP_RELEASES proven releases as rollback targets, plus only
+# the newest failed one for inspection. Failed builds must not count toward the
+# quota: a run of bad deploys would otherwise push every rollback target out.
+prune_releases() {
+  local in_use proven=0 failed=0 r
   in_use=$(for p in "${PORTS[@]}"; do readlink -f "$SLOTS/$p" 2>/dev/null || true; done; readlink -f "$CURRENT")
   find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r |
-    tail -n +$((KEEP_RELEASES + 1)) |
-    while read -r r; do grep -qxF "$RELEASES/$r" <<<"$in_use" || rm -rf -- "${RELEASES:?}/$r"; done
+    while read -r r; do
+      grep -qxF "$RELEASES/$r" <<<"$in_use" && continue
+      if [[ -f $RELEASES/$r/.deployable ]]; then
+        (( ++proven < KEEP_RELEASES )) && continue    # the live one is the KEEP_RELEASES-th
+      else
+        (( ++failed <= 1 )) && continue
+      fi
+      rm -rf -- "${RELEASES:?}/$r"
+    done
 }
 
 case ${1:-main} in
