@@ -2,7 +2,7 @@
 
 client_id = "fb959e692364c4077d75bd1908f8c38f"
 name = "Combined Discount"
-application_url = "https://combined-discount-shopify.fly.dev"
+application_url = "https://discount.treelogy-services.my.id"
 embedded = true
 
 [build]
@@ -33,10 +33,10 @@ scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_di
 
 [auth]
 redirect_urls = [
-  "https://combined-discount-shopify.fly.dev/auth/callback",
-  "https://combined-discount-shopify.fly.dev/auth/shopify/callback",
-  "https://combined-discount-shopify.fly.dev/api/auth",
-  "https://combined-discount-shopify.fly.dev/api/auth/callback"
+  "https://discount.treelogy-services.my.id/auth/callback",
+  "https://discount.treelogy-services.my.id/auth/shopify/callback",
+  "https://discount.treelogy-services.my.id/api/auth",
+  "https://discount.treelogy-services.my.id/api/auth/callback"
 ]
 
 [product.metafields.app.demo_info]
