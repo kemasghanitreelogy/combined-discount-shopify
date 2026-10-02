@@ -36,6 +36,18 @@ export function toDay(value) {
 }
 
 /** Returns the earlier of two `YYYY-MM-DD` days, ignoring blanks. */
+/**
+ * `customerSegmentMembers` returns CustomerSegmentMember ids. They share the
+ * customer's numeric id but are not Customer gids, and everything else — the
+ * facts, the redemption ledger, the order webhook and the Function's
+ * `buyerIdentity.customer.id` — keys on the Customer gid. Storing the member id
+ * splits one customer into two records that never meet.
+ */
+export function toCustomerGid(id) {
+  const numeric = String(id ?? "").split("/").pop();
+  return /^\d+$/.test(numeric) ? `gid://shopify/Customer/${numeric}` : null;
+}
+
 export function earlierDay(a, b) {
   if (!a) return b || null;
   if (!b) return a;

@@ -6,6 +6,7 @@ import {
   findCampaignState,
   parseIdList,
   serializeCustomerState,
+  toCustomerGid,
   toDay,
   upsertCampaignState,
 } from "./combined-discount.server";
@@ -178,7 +179,7 @@ export async function backfillPurchaseHistory({
         { qualifiedAt: qualifiedDay, uses: existing?.uses ?? 0 },
       );
       return {
-        customerId: node.id,
+        customerId: toCustomerGid(node.id),
         value: JSON.stringify(serializeCustomerState(next)),
         compareDigest: node?.state?.compareDigest ?? null,
       };

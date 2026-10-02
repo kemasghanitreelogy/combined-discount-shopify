@@ -169,21 +169,49 @@ export async function projectOrder({ admin, shop, payload }) {
     });
   }
 
+  // Dates only ever move earlier. The metafield can know an earlier day than
+  // the facts do — the backfill writes whole segments straight to it — and
+  // replacing that with this order's day would lock a qualifying customer out
+  // of a "purchased before" campaign the moment they buy again.
+  let published = null;
   await updateCustomerState(admin, order.customerId, (current) => {
-    let next = { ...(current ?? {}), firstPurchaseAt: firstPurchaseDay };
+    let next = {
+      ...(current ?? {}),
+      firstPurchaseAt: earlierDay(toDay(current?.firstPurchaseAt), firstPurchaseDay),
+    };
     for (const campaignKey of touched) {
       const existing = findCampaignState(next, campaignKey);
       next = upsertCampaignState(next, campaignKey, {
-        qualifiedAt: qualifiedAt[campaignKey] ?? existing?.qualifiedAt ?? null,
+        qualifiedAt: earlierDay(
+          toDay(qualifiedAt[campaignKey]),
+          toDay(existing?.qualifiedAt),
+        ),
         uses: uses[campaignKey] ?? existing?.uses ?? 0,
       });
     }
+    published = next;
     return next;
+  });
+
+  // Keep the facts from lagging behind what was just published, so the next
+  // order starts from the same earliest days.
+  const publishedQualified = { ...qualifiedAt };
+  for (const campaignKey of touched) {
+    const day = toDay(findCampaignState(published, campaignKey)?.qualifiedAt);
+    if (day) publishedQualified[campaignKey] = earlierDay(toDay(publishedQualified[campaignKey]), day);
+  }
+  const publishedFirst = toDay(published?.firstPurchaseAt) ?? firstPurchaseDay;
+  await db.customerPurchaseFact.update({
+    where: { shop_customerId: { shop, customerId: order.customerId } },
+    data: {
+      firstPurchaseAt: new Date(`${publishedFirst}T00:00:00.000Z`),
+      qualifiedAt: JSON.stringify(publishedQualified),
+    },
   });
 
   return {
     customerId: order.customerId,
-    firstPurchaseAt: firstPurchaseDay,
+    firstPurchaseAt: publishedFirst,
     redeemed: redeemed.map((c) => c.campaignKey),
     uses,
   };
