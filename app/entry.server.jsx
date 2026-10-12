@@ -4,6 +4,15 @@ import { ServerRouter } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { startSyncWorker } from "./lib/sync/worker.server";
+
+// The server entry is loaded once at boot, so the outbox starts draining
+// without waiting for a request. Production only: a dev server would
+// otherwise deliver from whatever database it happens to point at.
+// eslint-disable-next-line no-undef
+if (process.env.NODE_ENV === "production" || process.env.SYNC_WORKER === "1") {
+  startSyncWorker();
+}
 
 export const streamTimeout = 5000;
 

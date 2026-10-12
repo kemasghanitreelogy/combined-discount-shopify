@@ -7,6 +7,9 @@ import {
   upsertCampaignState,
 } from "./combined-discount.server";
 import { updateCustomerState } from "./customer-state.server";
+import { klaviyoEnabled } from "./klaviyo/client.server";
+import { enqueueProfileSync } from "./sync/outbox.server";
+import { kickSyncWorker } from "./sync/worker.server";
 
 const ORDERS_QUERY = `#graphql
   query CombinedDiscountRedeemedOrders($query: String!, $cursor: String) {
@@ -41,7 +44,11 @@ const ORDERS_QUERY = `#graphql
  * Cancelled orders are removed rather than kept, which also gives back the
  * allowance the plain webhook path never returns.
  */
-export async function reconcileRedemptions({ admin, shop, campaignKey = null }) {
+export async function reconcileRedemptions({
+  admin,
+  shop,
+  campaignKey = null,
+}) {
   const startedAt = Date.now();
 
   const campaigns = await syncCampaigns(
@@ -58,7 +65,10 @@ export async function reconcileRedemptions({ admin, shop, campaignKey = null }) 
     if (!campaign.code) {
       // Automatic discounts carry no code, so Shopify's order search cannot
       // isolate them; the webhook remains their only source.
-      report.push({ campaignKey: campaign.campaignKey, skipped: "no code to search by" });
+      report.push({
+        campaignKey: campaign.campaignKey,
+        skipped: "no code to search by",
+      });
       continue;
     }
 
@@ -91,8 +101,12 @@ export async function reconcileRedemptions({ admin, shop, campaignKey = null }) 
     });
     const known = new Map(rows.map((r) => [r.orderId, r]));
 
-    const missing = [...live.entries()].filter(([id, o]) => !known.has(id) && !o.cancelled);
-    const stale = [...live.entries()].filter(([id, o]) => known.has(id) && o.cancelled);
+    const missing = [...live.entries()].filter(
+      ([id, o]) => !known.has(id) && !o.cancelled,
+    );
+    const stale = [...live.entries()].filter(
+      ([id, o]) => known.has(id) && o.cancelled,
+    );
     const orphaned = rows.filter((r) => !live.has(r.orderId));
 
     const touched = new Set();
@@ -121,6 +135,20 @@ export async function reconcileRedemptions({ admin, shop, campaignKey = null }) 
       touched.add(row.customerId);
     }
 
+    // --- tell Klaviyo the counts moved -----------------------------------------
+    if (touched.size && klaviyoEnabled()) {
+      await db.$transaction(
+        [...touched].map((customerId) =>
+          enqueueProfileSync({
+            shop,
+            customerId,
+            campaignKey: campaign.campaignKey,
+          }),
+        ),
+      );
+      kickSyncWorker();
+    }
+
     // --- republish the read model the function actually consumes -------------
     let republished = 0;
     for (const customerId of touched) {
@@ -134,14 +162,20 @@ export async function reconcileRedemptions({ admin, shop, campaignKey = null }) 
       try {
         await updateCustomerState(admin, customerId, (current) => {
           const existing = findCampaignState(current, campaign.campaignKey);
-          return upsertCampaignState({ ...(current ?? {}) }, campaign.campaignKey, {
-            // Never invent a qualifying date: keep whatever the backfill or the
-            // webhook established, falling back to this customer's first
-            // redemption only if nothing is on record.
-            qualifiedAt:
-              existing?.qualifiedAt ?? toDay(earliest?.orderedAt ?? null) ?? null,
-            uses,
-          });
+          return upsertCampaignState(
+            { ...(current ?? {}) },
+            campaign.campaignKey,
+            {
+              // Never invent a qualifying date: keep whatever the backfill or the
+              // webhook established, falling back to this customer's first
+              // redemption only if nothing is on record.
+              qualifiedAt:
+                existing?.qualifiedAt ??
+                toDay(earliest?.orderedAt ?? null) ??
+                null,
+              uses,
+            },
+          );
         });
         republished += 1;
       } catch (error) {

@@ -8,6 +8,12 @@ import {
   upsertCampaignState,
 } from "./combined-discount.server";
 import { updateCustomerState } from "./customer-state.server";
+import { klaviyoEnabled } from "./klaviyo/client.server";
+import {
+  enqueueProfileSync,
+  enqueueRedemptionEvent,
+} from "./sync/outbox.server";
+import { kickSyncWorker } from "./sync/worker.server";
 
 const gid = (type, id) =>
   String(id).startsWith("gid://") ? String(id) : `gid://shopify/${type}/${id}`;
@@ -18,14 +24,17 @@ const gid = (type, id) =>
  * orders costs no extra Admin API reads.
  */
 export function normalizeOrderPayload(payload) {
-  const customerId = payload?.customer?.id ? gid("Customer", payload.customer.id) : null;
+  const customerId = payload?.customer?.id
+    ? gid("Customer", payload.customer.id)
+    : null;
   const orderedAt = payload?.processed_at || payload?.created_at || null;
 
   const productIds = new Set();
   const variantIds = new Set();
   for (const line of payload?.line_items ?? []) {
     if (line?.product_id) productIds.add(gid("Product", line.product_id));
-    if (line?.variant_id) variantIds.add(gid("ProductVariant", line.variant_id));
+    if (line?.variant_id)
+      variantIds.add(gid("ProductVariant", line.variant_id));
   }
 
   const codes = new Set();
@@ -41,7 +50,9 @@ export function normalizeOrderPayload(payload) {
   }
 
   return {
-    orderId: payload?.admin_graphql_api_id || (payload?.id ? gid("Order", payload.id) : null),
+    orderId:
+      payload?.admin_graphql_api_id ||
+      (payload?.id ? gid("Order", payload.id) : null),
     customerId,
     orderedAt,
     orderedDay: toDay(orderedAt),
@@ -68,9 +79,12 @@ export function orderQualifies(campaign, order) {
 
 /** True when this order actually redeemed the campaign's discount. */
 export function orderRedeems(campaign, order) {
-  if (campaign.code && order.codes.has(campaign.code.toLowerCase())) return true;
+  if (campaign.code && order.codes.has(campaign.code.toLowerCase()))
+    return true;
   // Automatic app discounts surface on the order under their title.
-  return Boolean(campaign.title) && order.titles.has(campaign.title.toLowerCase());
+  return (
+    Boolean(campaign.title) && order.titles.has(campaign.title.toLowerCase())
+  );
 }
 
 /**
@@ -135,26 +149,50 @@ export async function projectOrder({ admin, shop, payload }) {
   });
 
   // --- redemption ledger -------------------------------------------------
-  const redeemed = campaigns.filter((campaign) => orderRedeems(campaign, order));
-  for (const campaign of redeemed) {
-    await db.discountRedemption.upsert({
-      where: {
-        shop_campaignKey_orderId: {
-          shop,
-          campaignKey: campaign.campaignKey,
-          orderId: order.orderId,
-        },
-      },
-      create: {
-        shop,
-        campaignKey: campaign.campaignKey,
-        customerId: order.customerId,
-        orderId: order.orderId,
-        orderedAt: new Date(order.orderedAt),
-      },
-      update: {},
-    });
+  const redeemed = campaigns.filter((campaign) =>
+    orderRedeems(campaign, order),
+  );
+  const syncing = redeemed.length > 0 && klaviyoEnabled();
+  if (redeemed.length) {
+    // One transaction: the ledger row and the jobs that announce it either
+    // both exist or neither does, so a crash can't record a use Klaviyo never
+    // hears about. Replays are no-ops on every row.
+    await db.$transaction([
+      ...redeemed.map((campaign) =>
+        db.discountRedemption.upsert({
+          where: {
+            shop_campaignKey_orderId: {
+              shop,
+              campaignKey: campaign.campaignKey,
+              orderId: order.orderId,
+            },
+          },
+          create: {
+            shop,
+            campaignKey: campaign.campaignKey,
+            customerId: order.customerId,
+            orderId: order.orderId,
+            orderedAt: new Date(order.orderedAt),
+          },
+          update: {},
+        }),
+      ),
+      ...(syncing
+        ? [
+            ...redeemed.map((campaign) =>
+              enqueueRedemptionEvent({
+                shop,
+                customerId: order.customerId,
+                campaignKey: campaign.campaignKey,
+                orderId: order.orderId,
+              }),
+            ),
+            enqueueProfileSync({ shop, customerId: order.customerId }),
+          ]
+        : []),
+    ]);
   }
+  if (syncing) kickSyncWorker();
 
   // --- read model --------------------------------------------------------
   const touched = new Set([
@@ -177,7 +215,10 @@ export async function projectOrder({ admin, shop, payload }) {
   await updateCustomerState(admin, order.customerId, (current) => {
     let next = {
       ...(current ?? {}),
-      firstPurchaseAt: earlierDay(toDay(current?.firstPurchaseAt), firstPurchaseDay),
+      firstPurchaseAt: earlierDay(
+        toDay(current?.firstPurchaseAt),
+        firstPurchaseDay,
+      ),
     };
     for (const campaignKey of touched) {
       const existing = findCampaignState(next, campaignKey);
@@ -198,7 +239,11 @@ export async function projectOrder({ admin, shop, payload }) {
   const publishedQualified = { ...qualifiedAt };
   for (const campaignKey of touched) {
     const day = toDay(findCampaignState(published, campaignKey)?.qualifiedAt);
-    if (day) publishedQualified[campaignKey] = earlierDay(toDay(publishedQualified[campaignKey]), day);
+    if (day)
+      publishedQualified[campaignKey] = earlierDay(
+        toDay(publishedQualified[campaignKey]),
+        day,
+      );
   }
   const publishedFirst = toDay(published?.firstPurchaseAt) ?? firstPurchaseDay;
   await db.customerPurchaseFact.update({

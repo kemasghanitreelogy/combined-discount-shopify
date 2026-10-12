@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import {
+  useFetcher,
   useLoaderData,
   useNavigation,
   useRouteError,
@@ -13,6 +14,10 @@ import {
   withCustomerDetails,
 } from "../lib/usage-report.server";
 import { RECENT_DAYS, SEARCH_LIMIT } from "../lib/usage-constants";
+import db from "../db.server";
+import { klaviyoEnabled } from "../lib/klaviyo/client.server";
+import { KIND, syncStats } from "../lib/sync/outbox.server";
+import { kickSyncWorker } from "../lib/sync/worker.server";
 import {
   StatTile,
   StatusBadge,
@@ -53,7 +58,30 @@ export const loader = async ({ request }) => {
     matched: report.rows.length,
     campaignSummary: report.campaignSummary,
     rows: await withCustomerDetails(admin, pageRows),
+    sync: klaviyoEnabled() ? await syncStats(session.shop) : null,
   };
+};
+
+export const action = async ({ request }) => {
+  const { session } = await authenticate.admin(request);
+  const form = await request.formData();
+  if (form.get("intent") !== "klaviyo-resync" || !klaviyoEnabled()) {
+    return { ok: false, error: "Klaviyo sync is not configured." };
+  }
+  // Keyed to the minute, so a double click queues one resync, not two.
+  const minute = new Date().toISOString().slice(0, 16);
+  await db.syncJob.createMany({
+    data: [
+      {
+        shop: session.shop,
+        kind: KIND.resync,
+        dedupeKey: `resync:manual:${minute}`,
+      },
+    ],
+    skipDuplicates: true,
+  });
+  kickSyncWorker();
+  return { ok: true };
 };
 
 async function downloadCsv(search) {
@@ -82,9 +110,11 @@ export default function UsageOverview() {
     matched,
     campaignSummary,
     rows,
+    sync,
   } = useLoaderData();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigation = useNavigation();
+  const resync = useFetcher();
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState(null);
   const searchRef = useRef(null);
@@ -401,6 +431,59 @@ export default function UsageOverview() {
           </s-stack>
         )}
       </s-section>
+
+      {sync ? (
+        <s-section slot="aside" heading="Klaviyo sync">
+          <s-stack direction="block" gap="small-200">
+            <s-stack direction="inline" gap="small-200">
+              <s-badge
+                tone={
+                  sync.dead ? "critical" : sync.pending ? "info" : "success"
+                }
+              >
+                {sync.dead
+                  ? `${sync.dead} failed`
+                  : sync.pending
+                    ? `${sync.pending} queued`
+                    : "Up to date"}
+              </s-badge>
+            </s-stack>
+            <s-text tone="neutral">
+              Last delivered:{" "}
+              {sync.lastSuccessAt
+                ? new Date(sync.lastSuccessAt).toLocaleString()
+                : "never"}
+            </s-text>
+            {sync.retrying ? (
+              <s-text tone="caution">
+                Retrying: {sync.retrying.lastError}
+              </s-text>
+            ) : null}
+            {sync.dead ? (
+              <s-text tone="critical">
+                Latest failure: {sync.lastDead?.lastError}
+              </s-text>
+            ) : null}
+            <s-text tone="neutral">
+              Runs on every redemption and nightly at 02:00 WIB.
+            </s-text>
+            <s-button
+              onClick={() =>
+                resync.submit({ intent: "klaviyo-resync" }, { method: "POST" })
+              }
+              {...(resync.state !== "idle" ? { loading: true } : {})}
+            >
+              Sync all now
+            </s-button>
+            {resync.data?.ok ? (
+              <s-text tone="success">Full sync queued.</s-text>
+            ) : null}
+            {resync.data?.error ? (
+              <s-text tone="critical">{resync.data.error}</s-text>
+            ) : null}
+          </s-stack>
+        </s-section>
+      ) : null}
 
       <s-section slot="aside" heading="How this is counted">
         <s-paragraph>

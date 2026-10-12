@@ -18,7 +18,8 @@
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
     "typecheck": "react-router typegen && tsc --noEmit",
-    "deploy:vps": "ssh treelogy-vps sudo combined-discount-deploy"
+    "deploy:vps": "ssh treelogy-vps sudo combined-discount-deploy",
+    "test": "node --test tests/"
   },
   "type": "module",
   "engines": {
