@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import db from "../../db.server";
-import { nextDelayMs, shouldGiveUp } from "./backoff";
+import { nextDelayMs, shouldGiveUp, summarizeError } from "./backoff";
 
 /**
  * Durable queue of pushes to external systems, kept in Postgres next to the
@@ -133,7 +133,7 @@ export async function completeJob(job, note = null) {
 export async function failJob(job, error) {
   const retryable = error?.retryable !== false;
   const giveUp = shouldGiveUp({ attempts: job.attempts, retryable });
-  const message = String(error?.message || error).slice(0, 1000);
+  const message = summarizeError(error);
   const applied = await db.syncJob.updateMany({
     where: { id: job.id, version: job.version, status: "pending" },
     data: giveUp

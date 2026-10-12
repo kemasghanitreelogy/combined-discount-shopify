@@ -2,6 +2,7 @@ import db from "../../db.server";
 import { unauthenticated } from "../../shopify.server";
 import { klaviyoEnabled } from "../klaviyo/client.server";
 import { processJobs } from "./klaviyo-sync.server";
+import { summarizeError } from "./backoff";
 import { KIND, claimDueJobs, failJob } from "./outbox.server";
 
 /**
@@ -92,7 +93,7 @@ async function tick() {
     }
   } catch (error) {
     // The DB itself is unreachable; leases expire and the next tick retries.
-    console.error("[sync] tick failed:", error?.message || error);
+    console.error("[sync] tick failed:", summarizeError(error));
   } finally {
     state.running = false;
     if (state.again) kickSyncWorker();

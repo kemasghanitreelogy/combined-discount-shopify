@@ -24,3 +24,15 @@ export function nextDelayMs(
 export function shouldGiveUp({ attempts, retryable }) {
   return !retryable || attempts >= MAX_ATTEMPTS;
 }
+
+/**
+ * One readable line from an error. Prisma messages open with a blank line and
+ * an "Invalid `prisma.x()` invocation:" preamble; the cause comes after it.
+ */
+export function summarizeError(error) {
+  const text = String(error?.message ?? error ?? "unknown error")
+    .replace(/Invalid `prisma\.[^`]*` invocation:/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (text || "unknown error").slice(0, 500);
+}

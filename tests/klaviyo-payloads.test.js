@@ -9,7 +9,12 @@ import {
   redemptionEventBody,
 } from "../app/lib/klaviyo/payloads.js";
 
-const campaign = { campaignKey: "ck1", code: "HARGATETAP", title: "Harga Tetap", maxOrdersPerCustomer: 3 };
+const campaign = {
+  campaignKey: "ck1",
+  code: "HARGATETAP",
+  title: "Harga Tetap",
+  maxOrdersPerCustomer: 3,
+};
 
 test("label prefers code, then title, then key", () => {
   assert.equal(campaignLabel(campaign), "HARGATETAP");
@@ -33,8 +38,14 @@ test("properties match the names used by the 2026-10-12 import", () => {
 });
 
 test("uses left never goes negative and is null without a limit", () => {
-  assert.equal(campaignProperties(campaign, { uses: 5 })["HARGATETAP Uses Left"], 0);
-  const unlimited = campaignProperties({ ...campaign, maxOrdersPerCustomer: null }, { uses: 2 });
+  assert.equal(
+    campaignProperties(campaign, { uses: 5 })["HARGATETAP Uses Left"],
+    0,
+  );
+  const unlimited = campaignProperties(
+    { ...campaign, maxOrdersPerCustomer: null },
+    { uses: 2 },
+  );
   assert.equal(unlimited["HARGATETAP Uses Left"], null);
   assert.equal(unlimited["HARGATETAP Limit"], null);
 });
@@ -51,7 +62,16 @@ test("profile body is keyed by email and never carries consent", () => {
   const body = profileImportBody({
     email: "a@b.co",
     shopifyCustomerId: 42,
-    campaigns: [{ campaign, usage: { uses: 1, firstUsedAt: "2026-09-01T00:00:00Z", lastUsedAt: "2026-09-01T00:00:00Z" } }],
+    campaigns: [
+      {
+        campaign,
+        usage: {
+          uses: 1,
+          firstUsedAt: "2026-09-01T00:00:00Z",
+          lastUsedAt: "2026-09-01T00:00:00Z",
+        },
+      },
+    ],
   });
   assert.equal(body.data.type, "profile");
   assert.equal(body.data.attributes.email, "a@b.co");
@@ -71,9 +91,22 @@ test("list body lists profile ids", () => {
 });
 
 test("event is idempotent per order+campaign and reports uses at that order", () => {
-  const order = { orderId: "gid://shopify/Order/123", orderedAt: new Date("2026-10-01T05:00:00.000Z") };
-  const a = redemptionEventBody({ email: "a@b.co", campaign, order, usesAtOrder: 3 });
-  const b = redemptionEventBody({ email: "a@b.co", campaign, order, usesAtOrder: 3 });
+  const order = {
+    orderId: "gid://shopify/Order/123",
+    orderedAt: new Date("2026-10-01T05:00:00.000Z"),
+  };
+  const a = redemptionEventBody({
+    email: "a@b.co",
+    campaign,
+    order,
+    usesAtOrder: 3,
+  });
+  const b = redemptionEventBody({
+    email: "a@b.co",
+    campaign,
+    order,
+    usesAtOrder: 3,
+  });
   assert.deepEqual(a, b);
   const attrs = a.data.attributes;
   assert.equal(attrs.metric.data.attributes.name, REDEEMED_METRIC);
